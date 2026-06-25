@@ -1,0 +1,28 @@
+# ── Dashboard image ─────────────────────────────────────────────────────────
+# Intentionally lightweight: no ML libraries, no database drivers.
+# Only needs to talk to the FastAPI backend over HTTP.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+        streamlit>=1.35.0 \
+        plotly>=5.20.0 \
+        pandas>=2.0.0 \
+        numpy>=1.26.0 \
+        requests>=2.31.0
+
+COPY dashboard/ ./dashboard/
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+# Override at runtime with the actual API host.
+ENV FASTAPI_URL=http://api:8000
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "dashboard/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--browser.gatherUsageStats=false"]

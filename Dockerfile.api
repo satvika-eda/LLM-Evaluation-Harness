@@ -1,0 +1,43 @@
+# ── Base image ─────────────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System packages:
+#   libpq-dev + gcc  — compile psycopg2 C extension
+#   curl             — used by the docker-compose healthcheck for the api service
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq-dev \
+        gcc \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python dependencies ─────────────────────────────────────────────────────
+# Pre-install CPU-only PyTorch so pip resolves the slim CPU wheel (~250 MB)
+# instead of the default CUDA wheel (~2 GB) when bert-score pulls torch in.
+RUN pip install --no-cache-dir \
+        torch \
+        --index-url https://download.pytorch.org/whl/cpu
+
+# Copy the package manifests before the source so Docker can cache the
+# dependency-install layer independently of source-only changes.
+COPY pyproject.toml README.md ./
+
+# Copy source tree and install the local package (non-editable).
+# pip will skip torch since the CPU wheel is already satisfied above.
+COPY src/ ./src/
+RUN pip install --no-cache-dir .
+
+# ── Runtime config ───────────────────────────────────────────────────────────
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8000
+
+# Default entrypoint — the `worker` service overrides this in docker-compose:
+#   command: ["python", "-m", "src.worker.worker"]
+CMD ["uvicorn", "src.api.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1"]

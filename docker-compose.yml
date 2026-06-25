@@ -1,0 +1,99 @@
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-llm_eval}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-llm_eval}
+      POSTGRES_DB:       ${POSTGRES_DB:-llm_eval}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llm_eval} -d ${POSTGRES_DB:-llm_eval}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    # appendonly yes ensures the job queue survives container restarts
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── FastAPI ─────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL:        postgresql://${POSTGRES_USER:-llm_eval}:${POSTGRES_PASSWORD:-llm_eval}@postgres:5432/${POSTGRES_DB:-llm_eval}
+      REDIS_URL:           redis://redis:6379/0
+      OPENAI_API_KEY:      ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY:   ${ANTHROPIC_API_KEY:-}
+      HUGGINGFACE_API_KEY: ${HUGGINGFACE_API_KEY:-}
+      LOG_LEVEL:           ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── RQ Worker ───────────────────────────────────────────────────────────────
+  # Same image as `api`; only the entrypoint differs.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["python", "-m", "src.worker.worker"]
+    environment:
+      DATABASE_URL:        postgresql://${POSTGRES_USER:-llm_eval}:${POSTGRES_PASSWORD:-llm_eval}@postgres:5432/${POSTGRES_DB:-llm_eval}
+      REDIS_URL:           redis://redis:6379/0
+      OPENAI_API_KEY:      ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY:   ${ANTHROPIC_API_KEY:-}
+      HUGGINGFACE_API_KEY: ${HUGGINGFACE_API_KEY:-}
+      LOG_LEVEL:           ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Streamlit Dashboard ─────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      FASTAPI_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,223 @@
+name: Eval Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One run per branch at a time; cancels any in-progress run on new push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POSTGRES_USER:     llm_eval
+  POSTGRES_PASSWORD: llm_eval
+  POSTGRES_DB:       llm_eval
+
+jobs:
+  smoke-eval:
+    name: "Smoke eval — TruthfulQA / 50 Qs / GPT-4o"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── 2. Build & start the full compose stack ──────────────────────────────
+      - name: Start compose stack
+        run: docker compose up -d --build
+        env:
+          OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
+
+      # ── 3. Wait for the API to be healthy ────────────────────────────────────
+      - name: Wait for API health
+        run: |
+          echo "Polling http://localhost:8000/health …"
+          for i in $(seq 1 36); do
+            HEALTH=$(curl -sf http://localhost:8000/health 2>/dev/null || echo '{}')
+            STATUS=$(echo "$HEALTH" | python3 -c \
+              "import json,sys; print(json.load(sys.stdin).get('status',''))" \
+              2>/dev/null || echo '')
+            if [ "$STATUS" = "ok" ]; then
+              echo "✅ API is healthy (attempt $i)."
+              exit 0
+            fi
+            echo "  Not ready yet (attempt $i/36) — sleeping 10 s…"
+            sleep 10
+          done
+          echo "❌ API never became healthy. Dumping logs:"
+          docker compose logs api postgres redis
+          exit 1
+
+      # ── 4. Submit smoke eval ─────────────────────────────────────────────────
+      - name: Submit smoke eval
+        id: submit
+        run: |
+          RESPONSE=$(curl -sf -X POST http://localhost:8000/run-eval \
+            -H "Content-Type: application/json" \
+            -d '{
+              "run_name":    "ci-smoke",
+              "dataset_name":"truthfulqa",
+              "n_questions": 50,
+              "models":      ["gpt-4o"]
+            }')
+          echo "API response: $RESPONSE"
+          RUN_ID=$(echo "$RESPONSE" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin)['run_id'])")
+          JOB_ID=$(echo "$RESPONSE" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin)['job_id'])")
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "Submitted: run_id=$RUN_ID  job_id=$JOB_ID"
+
+      # ── 5. Poll until completed or failed (max 30 min) ───────────────────────
+      - name: Wait for eval completion
+        env:
+          RUN_ID: ${{ steps.submit.outputs.run_id }}
+        run: |
+          echo "Polling /runs for run_id=$RUN_ID (120 × 15 s = 30 min max)…"
+          for i in $(seq 1 120); do
+            STATUS=$(curl -sf http://localhost:8000/runs | python3 -c "
+import json, sys, os
+runs = json.load(sys.stdin)
+run  = next((r for r in runs if r['id'] == int(os.environ['RUN_ID'])), None)
+print(run['status'] if run else 'not_found')
+")
+            echo "  Poll $i/120 → status=$STATUS"
+            case "$STATUS" in
+              completed)
+                echo "✅ Eval completed."
+                exit 0 ;;
+              failed)
+                echo "❌ Eval reported FAILED."
+                docker compose logs worker --tail=80
+                exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "❌ Timed out after 30 min."
+          docker compose logs worker --tail=80
+          exit 1
+
+      # ── 6. Fetch scores ──────────────────────────────────────────────────────
+      - name: Fetch and parse results
+        id: results
+        env:
+          RUN_ID: ${{ steps.submit.outputs.run_id }}
+        run: |
+          PAYLOAD=$(curl -sf "http://localhost:8000/results/$RUN_ID")
+          echo "Results payload: $PAYLOAD"
+
+          FAITH=$(echo "$PAYLOAD" | python3 -c "
+import json, sys
+d = json.load(sys.stdin).get('results', {})
+scores = next(iter(d.values()), {})
+v = scores.get('ragas/faithfulness')
+print(f'{v:.4f}' if v is not None else 'N/A')
+")
+          HALLUC=$(echo "$PAYLOAD" | python3 -c "
+import json, sys
+d = json.load(sys.stdin).get('results', {})
+scores = next(iter(d.values()), {})
+v = scores.get('deepeval/hallucination')
+print(f'{v:.4f}' if v is not None else 'N/A')
+")
+          BF1=$(echo "$PAYLOAD" | python3 -c "
+import json, sys
+d = json.load(sys.stdin).get('results', {})
+scores = next(iter(d.values()), {})
+v = scores.get('bertscore/f1')
+print(f'{v:.4f}' if v is not None else 'N/A')
+")
+          MODEL=$(echo "$PAYLOAD" | python3 -c "
+import json, sys
+d = json.load(sys.stdin).get('results', {})
+print(next(iter(d.keys()), 'gpt-4o'))
+")
+          echo "faithfulness=$FAITH"   >> "$GITHUB_OUTPUT"
+          echo "hallucination=$HALLUC" >> "$GITHUB_OUTPUT"
+          echo "bertscore_f1=$BF1"    >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL"          >> "$GITHUB_OUTPUT"
+
+      # ── 7. Post summary comment on the PR (or commit) ────────────────────────
+      - name: Post results comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId        = '${{ steps.submit.outputs.run_id }}';
+            const jobId        = '${{ steps.submit.outputs.job_id }}';
+            const faithfulness = '${{ steps.results.outputs.faithfulness }}';
+            const hallucination= '${{ steps.results.outputs.hallucination }}';
+            const bertscoreF1  = '${{ steps.results.outputs.bertscore_f1 }}';
+            const model        = '${{ steps.results.outputs.model }}';
+            const sha7         = context.sha.slice(0, 7);
+
+            const body = [
+              '## 🧪 Eval Smoke Test Results',
+              '',
+              `**Commit:** \`${sha7}\` · **Run ID:** \`${runId}\` · **Job ID:** \`${jobId}\``,
+              `**Dataset:** TruthfulQA · **Questions:** 50 · **Model:** \`${model}\``,
+              '',
+              '| Metric | Score | Direction |',
+              '|:-------|:-----:|:----------|',
+              `| RAGAS Faithfulness     | \`${faithfulness}\`  | ↑ higher is better |`,
+              `| DeepEval Hallucination | \`${hallucination}\` | ↓ lower is better  |`,
+              `| BERTScore F1           | \`${bertscoreF1}\`   | ↑ higher is better |`,
+              '',
+              '<details><summary>Metric definitions</summary>',
+              '',
+              '- **Faithfulness** — measures whether the answer is grounded in the provided context (RAGAS judge via GPT-4o).',
+              '- **Hallucination** — fraction of claims that contradict reference facts (DeepEval, 0 = no hallucination).',
+              '- **BERTScore F1** — semantic similarity between the generated answer and the ground-truth using DeBERTa-xlarge.',
+              '',
+              '</details>',
+              '',
+              '*Auto-generated by [eval.yml](.github/workflows/eval.yml)*',
+            ].join('\n');
+
+            // Prefer PR comment; fall back to commit comment.
+            const prNumber = context.payload.pull_request?.number;
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+              return;
+            }
+
+            // Push to main — try to find an open PR for this branch.
+            const branch = context.ref.replace('refs/heads/', '');
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              head:  `${context.repo.owner}:${branch}`,
+            });
+            if (prs.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: prs[0].number,
+                body,
+              });
+            } else {
+              // Final fallback: commit comment.
+              await github.rest.repos.createCommitComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                commit_sha: context.sha,
+                body,
+              });
+            }
+
+      # ── 8. Always dump logs on failure ──────────────────────────────────────
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs --tail=150
