@@ -116,7 +116,9 @@ def load_truthfulqa(split: str = "validation", n: int | None = None) -> list[dic
     list[dict] with keys: dataset_name, question, ground_truth, context
     """
     logger.info("Loading TruthfulQA (%s split)…", split)
-    ds: Dataset = load_dataset("truthful_qa", "multiple_choice", split=split, trust_remote_code=False)
+    ds: Dataset = load_dataset(
+        "truthfulqa/truthful_qa", "multiple_choice", split=split, trust_remote_code=False
+    )
 
     if n is not None:
         ds = ds.select(range(min(n, len(ds))))
@@ -143,7 +145,9 @@ def load_hotpotqa(split: str = "validation", n: int | None = None) -> list[dict]
     list[dict] with keys: dataset_name, question, ground_truth, context
     """
     logger.info("Loading HotpotQA distractor (%s split)…", split)
-    ds: Dataset = load_dataset("hotpot_qa", "distractor", split=split, trust_remote_code=False)
+    ds: Dataset = load_dataset(
+        "hotpotqa/hotpot_qa", "distractor", split=split, trust_remote_code=False
+    )
 
     if n is not None:
         ds = ds.select(range(min(n, len(ds))))

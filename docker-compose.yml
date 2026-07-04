@@ -3,6 +3,7 @@ services:
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
     image: postgres:15
+    platform: linux/arm64/v8
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
@@ -20,6 +21,7 @@ services:
   # ── Redis ───────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
+    platform: linux/arm64/v8
     # appendonly yes ensures the job queue survives container restarts
     command: redis-server --appendonly yes
     volumes:

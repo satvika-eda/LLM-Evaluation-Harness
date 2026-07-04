@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
+import types
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -35,6 +37,43 @@ from src.scorers import ScoringInput
 logger = logging.getLogger(__name__)
 
 _METRIC_PREFIX = "ragas"
+
+
+def _install_vertexai_shim() -> None:
+    """Compatibility shim for ragas importing a removed langchain module.
+
+    ``ragas.llms.base`` hard-imports ``ChatVertexAI`` from
+    ``langchain_community.chat_models.vertexai`` — a submodule that
+    langchain-community >=0.3 removed (Vertex AI moved to the standalone
+    ``langchain-google-vertexai`` package). This harness only uses ChatOpenAI,
+    and ragas references ``ChatVertexAI`` merely as a type in its
+    "supports multiple completions" detection tuple — never instantiating it.
+
+    Registering a stub module lets ``import ragas`` succeed without pinning an
+    end-of-life langchain-community. If the real standalone package is present,
+    its class is used instead of the stub.
+    """
+    mod_name = "langchain_community.chat_models.vertexai"
+    if mod_name in sys.modules:
+        return
+    try:
+        import langchain_community.chat_models as _chat_models
+    except Exception:
+        return
+    if hasattr(_chat_models, "vertexai"):
+        return
+    try:
+        from langchain_google_vertexai import ChatVertexAI  # type: ignore
+    except Exception:
+        class ChatVertexAI:  # minimal stub; never instantiated in this harness
+            pass
+    shim = types.ModuleType(mod_name)
+    shim.ChatVertexAI = ChatVertexAI
+    sys.modules[mod_name] = shim
+    _chat_models.vertexai = shim  # type: ignore[attr-defined]
+
+
+_install_vertexai_shim()
 
 
 class RAGASScorer:

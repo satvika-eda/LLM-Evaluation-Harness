@@ -217,9 +217,16 @@ def run_eval_pipeline(
         raw_questions = _load_questions(dataset_name, n_questions)
 
         with SessionLocal() as session:
-            questions = save_questions_to_db(raw_questions, session)
+            session.expire_on_commit = False  # keep attribute values after commit
+            save_questions_to_db(raw_questions, session)
             session.commit()
-            # Expunge so the objects can be used outside this session.
+            # Fetch all questions for this dataset (new + pre-existing duplicates).
+            questions = (
+                session.query(Question)
+                .filter(Question.dataset_name == dataset_name)
+                .limit(n_questions)
+                .all()
+            )
             session.expunge_all()
 
         logger.info("%d questions ready (new + existing).", len(questions))

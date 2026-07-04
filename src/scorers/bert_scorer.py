@@ -74,10 +74,33 @@ class BERTScorer:
             self._scorer = _BERTScorer(
                 model_type=_MODEL_TYPE,
                 device=self._device,
+                lang="en",
                 rescale_with_baseline=True,
             )
+            self._clamp_tokenizer_max_length()
             logger.info("BERTScorer model loaded.")
         return self._scorer
+
+    @staticmethod
+    def _sentinel_max_length(tokenizer: Any) -> bool:
+        return getattr(tokenizer, "model_max_length", 0) > 100_000
+
+    def _clamp_tokenizer_max_length(self) -> None:
+        """Clamp an unset tokenizer max length to the model's real context size.
+
+        When a tokenizer has no configured max length, transformers reports it
+        as a huge sentinel (VERY_LARGE_INTEGER ≈ 1e30). bert-score passes that
+        value straight to the Rust tokenizer's truncation, which raises
+        ``OverflowError: int too big to convert``. Fall back to the model's
+        ``max_position_embeddings`` (512 for DeBERTa-xlarge-mnli).
+        """
+        tokenizer = getattr(self._scorer, "_tokenizer", None)
+        if tokenizer is None or not self._sentinel_max_length(tokenizer):
+            return
+        model = getattr(self._scorer, "_model", None)
+        max_len = getattr(getattr(model, "config", None), "max_position_embeddings", 512)
+        tokenizer.model_max_length = int(max_len)
+        logger.info("Clamped BERTScore tokenizer model_max_length to %d.", max_len)
 
     # ── Core scoring (sync, runs in executor) ─────────────────────────────────
 

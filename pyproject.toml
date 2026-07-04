@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-evaluation-harness"
@@ -13,6 +13,7 @@ dependencies = [
     "ragas>=0.2.0",
     "deepeval>=0.21.0",
     "langchain-openai>=0.1.0",
+    "langchain-community>=0.2.0",
     # LLM providers
     "openai>=1.0.0",
     "anthropic>=0.25.0",
@@ -47,6 +48,13 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.4.0",
     "mypy>=1.9.0",
+]
+# Streamlit dashboard (also installed directly in Dockerfile.dashboard).
+# Kept as an extra so `pip install -e ".[dashboard]"` works for local runs.
+dashboard = [
+    "streamlit>=1.35.0",
+    "plotly>=5.20.0",
+    "requests>=2.31.0",
 ]
 
 [tool.setuptools.packages.find]

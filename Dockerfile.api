@@ -1,14 +1,12 @@
 # ── Base image ─────────────────────────────────────────────────────────────────
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# System packages:
-#   libpq-dev + gcc  — compile psycopg2 C extension
-#   curl             — used by the docker-compose healthcheck for the api service
+# curl is used by the docker-compose healthcheck for the api service.
+# libpq-dev / gcc are NOT needed because pyproject.toml uses psycopg2-binary,
+# which ships its own statically-linked libpq.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libpq-dev \
-        gcc \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
