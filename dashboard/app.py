@@ -27,9 +27,9 @@ import streamlit as st
 FASTAPI_URL: str = os.environ.get("FASTAPI_URL", "http://localhost:8000").rstrip("/")
 
 KNOWN_MODELS: list[str] = [
-    "gpt-4o",
-    "claude-3-5-sonnet-20241022",
-    "mistral-7b",
+    "llama-3.1-8b",
+    "qwen2.5-72b",
+    "deepseek-v3.2",
 ]
 
 KNOWN_DATASETS: list[str] = ["truthfulqa", "hotpotqa"]
@@ -242,17 +242,26 @@ with tab_cv:
             st.info("Cost or faithfulness scores are not yet available.")
         else:
             df_sc = pd.DataFrame(scatter_rows)
+            # BERTScore F1 with rescale_with_baseline can go negative for
+            # dissimilar text; plotly marker size must be >= 0. Use a clamped
+            # copy for the bubble size and keep the true F1 for the hover label.
+            df_sc["_bubble"] = df_sc["BERTScore F1"].clip(lower=0.02)
             fig_sc = px.scatter(
                 df_sc,
                 x="Avg Cost / Q ($)",
                 y="Faithfulness",
-                size="BERTScore F1",
+                size="_bubble",
                 text="Model",
                 color="Model",
                 size_max=70,
                 color_discrete_sequence=px.colors.qualitative.Set2,
                 template="plotly_white",
-                hover_data={"Avg Cost / Q ($)": ":.6f", "Faithfulness": ":.3f", "BERTScore F1": ":.3f"},
+                hover_data={
+                    "Avg Cost / Q ($)": ":.6f",
+                    "Faithfulness": ":.3f",
+                    "BERTScore F1": ":.3f",
+                    "_bubble": False,
+                },
             )
             fig_sc.update_traces(
                 textposition="top center",

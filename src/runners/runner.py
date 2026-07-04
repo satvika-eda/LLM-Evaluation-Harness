@@ -1,19 +1,25 @@
 """
 Async model runner for the LLM evaluation harness.
 
-Calls OpenAI GPT-4o, Anthropic Claude Sonnet, and Mistral-7B (via HuggingFace
-Inference API) concurrently for a single question, with:
+Benchmarks a set of open-weight models served through the HuggingFace
+Inference Providers router (OpenAI-compatible chat-completions endpoint),
+concurrently for a single question, with:
 
   - Redis cache check before every API call (cache_hit=True skips inference)
   - Exponential backoff retry on rate-limit / transient errors
   - Per-call telemetry: latency_ms, input_tokens, output_tokens, cost_usd
   - Persistence of all results to the PostgreSQL responses table
 
-Pricing constants (per 1 000 output tokens, USD)
--------------------------------------------------
-  GPT-4o          $0.005
-  Claude Sonnet   $0.003
-  Mistral-7B      $0.0002
+All models are open-weight and reached via a single provider (the HF router),
+so adding or swapping a model is just an entry in the _MODELS registry below —
+no new caller code. The LLM judge used for scoring (RAGAS / DeepEval) is
+configured separately in the scorers and is independent of this runner.
+
+Model registry (canonical name -> HF model id, cost per 1 000 output tokens)
+----------------------------------------------------------------------------
+  llama-3.1-8b    meta-llama/Llama-3.1-8B-Instruct   ~$0.0002 / 1K out
+  qwen2.5-72b     Qwen/Qwen2.5-72B-Instruct          ~$0.0008 / 1K out
+  deepseek-v3.2   deepseek-ai/DeepSeek-V3.2           ~$0.0003 / 1K out
 
 Public API
 ----------
@@ -32,8 +38,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-import anthropic
-import openai
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
@@ -44,32 +48,25 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# ── Pricing (USD per 1 000 output tokens) ────────────────────────────────────
+# ── Model registry ────────────────────────────────────────────────────────────
+# Canonical name -> HF Inference Providers model id + cost per 1 000 output
+# tokens (USD). Costs are approximate router rates and vary by the provider the
+# router selects; they only affect the reported cost_usd telemetry. To add a
+# model, confirm it is a chat model on the router (GET /v1/models) and add a row.
 
-_COST_PER_1K: dict[str, float] = {
-    "gpt-4o":              0.005,
-    "claude-3-5-sonnet":   0.003,
-    "mistral-7b":          0.0002,
+_MODELS: dict[str, dict[str, Any]] = {
+    "llama-3.1-8b":  {"hf_id": "meta-llama/Llama-3.1-8B-Instruct", "cost_per_1k": 0.0002},
+    "qwen2.5-72b":   {"hf_id": "Qwen/Qwen2.5-72B-Instruct",        "cost_per_1k": 0.0008},
+    "deepseek-v3.2": {"hf_id": "deepseek-ai/DeepSeek-V3.2",        "cost_per_1k": 0.0003},
 }
+
+_HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
 
 # ── Retry config ──────────────────────────────────────────────────────────────
 
 _MAX_RETRIES = 4
 _RETRY_BASE_DELAY = 1.0   # seconds; doubles each attempt
 _RETRY_MAX_DELAY = 30.0
-
-# ── Rate-limit exception types per provider ───────────────────────────────────
-
-_OPENAI_RATE_LIMIT_ERRORS = (
-    openai.RateLimitError,
-    openai.APITimeoutError,
-    openai.APIConnectionError,
-)
-_ANTHROPIC_RATE_LIMIT_ERRORS = (
-    anthropic.RateLimitError,
-    anthropic.APITimeoutError,
-    anthropic.APIConnectionError,
-)
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
 
@@ -111,7 +108,8 @@ class ModelResult:
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _compute_cost(model_name: str, output_tokens: int) -> float:
-    rate = _COST_PER_1K.get(model_name, 0.0)
+    spec = _MODELS.get(model_name)
+    rate = spec["cost_per_1k"] if spec else 0.0
     return round(rate * output_tokens / 1_000, 8)
 
 
@@ -153,138 +151,46 @@ async def _backoff_sleep(attempt: int) -> None:
     await asyncio.sleep(max(0.0, delay + jitter))
 
 
-# ── Per-provider callers ──────────────────────────────────────────────────────
+# ── HF Inference Providers router caller ──────────────────────────────────────
 
-async def _call_openai(question: str) -> ModelResult:
-    """Call GPT-4o via the async OpenAI client."""
-    client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    last_exc: Exception | None = None
-
-    for attempt in range(_MAX_RETRIES):
-        try:
-            t0 = time.monotonic()
-            resp = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": question}],
-                temperature=0.0,
-            )
-            latency_ms = int((time.monotonic() - t0) * 1_000)
-
-            text = resp.choices[0].message.content or ""
-            in_tok = resp.usage.prompt_tokens if resp.usage else 0
-            out_tok = resp.usage.completion_tokens if resp.usage else 0
-
-            return ModelResult(
-                model_name="gpt-4o",
-                question_id=0,   # caller patches this
-                run_id=0,        # caller patches this
-                response_text=text,
-                latency_ms=latency_ms,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                cost_usd=_compute_cost("gpt-4o", out_tok),
-            )
-
-        except _OPENAI_RATE_LIMIT_ERRORS as exc:
-            last_exc = exc
-            logger.warning("OpenAI rate limit (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
-            await _backoff_sleep(attempt)
-
-        except openai.OpenAIError as exc:
-            # Non-retryable provider error
-            logger.error("OpenAI non-retryable error: %s", exc)
-            return ModelResult(model_name="gpt-4o", question_id=0, run_id=0, error=str(exc))
-
-    return ModelResult(
-        model_name="gpt-4o",
-        question_id=0,
-        run_id=0,
-        error=f"Exceeded {_MAX_RETRIES} retries: {last_exc}",
-    )
-
-
-async def _call_anthropic(question: str) -> ModelResult:
-    """Call Claude 3.5 Sonnet via the async Anthropic client."""
-    client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    last_exc: Exception | None = None
-
-    for attempt in range(_MAX_RETRIES):
-        try:
-            t0 = time.monotonic()
-            resp = await client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": question}],
-            )
-            latency_ms = int((time.monotonic() - t0) * 1_000)
-
-            text = resp.content[0].text if resp.content else ""
-            in_tok = resp.usage.input_tokens if resp.usage else 0
-            out_tok = resp.usage.output_tokens if resp.usage else 0
-
-            return ModelResult(
-                model_name="claude-3-5-sonnet",
-                question_id=0,
-                run_id=0,
-                response_text=text,
-                latency_ms=latency_ms,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                cost_usd=_compute_cost("claude-3-5-sonnet", out_tok),
-            )
-
-        except _ANTHROPIC_RATE_LIMIT_ERRORS as exc:
-            last_exc = exc
-            logger.warning(
-                "Anthropic rate limit (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc
-            )
-            await _backoff_sleep(attempt)
-
-        except anthropic.APIError as exc:
-            logger.error("Anthropic non-retryable error: %s", exc)
-            return ModelResult(
-                model_name="claude-3-5-sonnet", question_id=0, run_id=0, error=str(exc)
-            )
-
-    return ModelResult(
-        model_name="claude-3-5-sonnet",
-        question_id=0,
-        run_id=0,
-        error=f"Exceeded {_MAX_RETRIES} retries: {last_exc}",
-    )
-
-
-async def _call_mistral_hf(question: str, session: aiohttp.ClientSession) -> ModelResult:
+async def _call_hf_router(
+    model_name: str,
+    question: str,
+    session: aiohttp.ClientSession,
+) -> ModelResult:
     """
-    Call Mistral-7B-Instruct via the HuggingFace Inference API.
+    Call an open-weight model via the HuggingFace Inference Providers router.
 
-    Uses the text-generation endpoint with the standard [INST] prompt format.
-    Retries on HTTP 429 (rate limit) and 503 (model loading).
+    Uses the OpenAI-compatible chat-completions endpoint at
+    router.huggingface.co. The chat template is applied server-side and the
+    response carries real token usage. Retries on HTTP 429 (rate limit) and
+    503 (model loading / cold start); a slow first call is normal while a
+    provider cold-starts a large model.
     """
     hf_token = os.environ["HUGGINGFACE_API_KEY"]
-    url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+    hf_id = _MODELS[model_name]["hf_id"]
     headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
     payload = {
-        "inputs": f"[INST] {question} [/INST]",
-        "parameters": {
-            "max_new_tokens": 512,
-            "temperature": 0.01,   # near-zero; HF API doesn't accept exactly 0
-            "return_full_text": False,
-        },
+        "model": hf_id,
+        "messages": [{"role": "user", "content": question}],
+        "max_tokens": 512,
+        "temperature": 0.01,   # near-zero; the router doesn't accept exactly 0
+        "stream": False,
     }
     last_exc: Exception | None = None
 
     for attempt in range(_MAX_RETRIES):
         try:
             t0 = time.monotonic()
-            async with session.post(url, headers=headers, json=payload) as resp:
+            async with session.post(_HF_ROUTER_URL, headers=headers, json=payload) as resp:
                 latency_ms = int((time.monotonic() - t0) * 1_000)
 
                 if resp.status in (429, 503):
                     body = await resp.text()
                     last_exc = RuntimeError(f"HTTP {resp.status}: {body[:200]}")
                     logger.warning(
-                        "HuggingFace rate limit/loading (attempt %d/%d): %s",
+                        "HF router rate limit/loading %s (attempt %d/%d): %s",
+                        model_name,
                         attempt + 1,
                         _MAX_RETRIES,
                         last_exc,
@@ -295,32 +201,37 @@ async def _call_mistral_hf(question: str, session: aiohttp.ClientSession) -> Mod
                 if not resp.ok:
                     body = await resp.text()
                     err = f"HTTP {resp.status}: {body[:400]}"
-                    logger.error("HuggingFace non-retryable error: %s", err)
-                    return ModelResult(model_name="mistral-7b", question_id=0, run_id=0, error=err)
+                    logger.error("HF router non-retryable error for %s: %s", model_name, err)
+                    return ModelResult(model_name=model_name, question_id=0, run_id=0, error=err)
 
                 data = await resp.json()
-                text: str = data[0].get("generated_text", "") if isinstance(data, list) else ""
+                choices = data.get("choices") or []
+                text: str = (
+                    (choices[0].get("message") or {}).get("content", "") if choices else ""
+                )
 
-                # HF text-generation does not return token counts; estimate from
-                # character length (≈ 4 chars per token) as a billing proxy.
-                out_tok = max(1, len(text) // 4)
-                in_tok = max(1, len(question) // 4)
+                # The router is OpenAI-compatible and returns real token usage;
+                # fall back to a char-length estimate if a provider omits it.
+                usage = data.get("usage") or {}
+                in_tok = usage.get("prompt_tokens") or max(1, len(question) // 4)
+                out_tok = usage.get("completion_tokens") or max(1, len(text) // 4)
 
                 return ModelResult(
-                    model_name="mistral-7b",
-                    question_id=0,
-                    run_id=0,
+                    model_name=model_name,
+                    question_id=0,   # caller patches this
+                    run_id=0,        # caller patches this
                     response_text=text,
                     latency_ms=latency_ms,
                     input_tokens=in_tok,
                     output_tokens=out_tok,
-                    cost_usd=_compute_cost("mistral-7b", out_tok),
+                    cost_usd=_compute_cost(model_name, out_tok),
                 )
 
         except aiohttp.ClientError as exc:
             last_exc = exc
             logger.warning(
-                "HuggingFace connection error (attempt %d/%d): %s",
+                "HF router connection error %s (attempt %d/%d): %s",
+                model_name,
                 attempt + 1,
                 _MAX_RETRIES,
                 exc,
@@ -328,7 +239,7 @@ async def _call_mistral_hf(question: str, session: aiohttp.ClientSession) -> Mod
             await _backoff_sleep(attempt)
 
     return ModelResult(
-        model_name="mistral-7b",
+        model_name=model_name,
         question_id=0,
         run_id=0,
         error=f"Exceeded {_MAX_RETRIES} retries: {last_exc}",
@@ -380,11 +291,11 @@ async def run_all_models(
     session: Session,
 ) -> list[ModelResult]:
     """
-    Call all three models concurrently for a single question.
+    Call every registered model concurrently for a single question.
 
     For each model:
       1. Check Redis cache — return cached result immediately if hit.
-      2. Call provider API with exponential-backoff retry.
+      2. Call the HF router with exponential-backoff retry.
       3. On success, write result to Redis cache.
       4. Save result to the PostgreSQL responses table.
 
@@ -397,15 +308,16 @@ async def run_all_models(
 
     Returns
     -------
-    list[ModelResult] — one entry per model, in the order
-    [gpt-4o, claude-3-5-sonnet, mistral-7b]. Errors are recorded in
-    ModelResult.error; the list always has exactly 3 elements.
+    list[ModelResult] — one entry per model in _MODELS registry order. Errors
+    are recorded in ModelResult.error; the list always has one element per
+    registered model.
     """
     async with aiohttp.ClientSession() as http:
         results = await asyncio.gather(
-            run_single_model("gpt-4o",            question, question_id, run_id, session, http),
-            run_single_model("claude-3-5-sonnet", question, question_id, run_id, session, http),
-            run_single_model("mistral-7b",        question, question_id, run_id, session, http),
+            *(
+                run_single_model(name, question, question_id, run_id, session, http)
+                for name in _MODELS
+            ),
             return_exceptions=False,
         )
     return list(results)
@@ -424,12 +336,12 @@ async def run_single_model(
 
     Parameters
     ----------
-    model_name   : one of "gpt-4o", "claude-3-5-sonnet", "mistral-7b"
+    model_name   : a key in the _MODELS registry
     question     : question text
     question_id  : FK / cache key
     run_id       : FK for the Response row
     session      : active SQLAlchemy Session
-    http_session : shared aiohttp session for Mistral calls; created
+    http_session : shared aiohttp session for router calls; created
                    internally if not provided (use run_all_models instead
                    to share the session across concurrent calls)
 
@@ -439,11 +351,11 @@ async def run_single_model(
 
     Raises
     ------
-    ValueError if model_name is not recognised.
+    ValueError if model_name is not in the registry.
     """
-    if model_name not in _COST_PER_1K:
+    if model_name not in _MODELS:
         raise ValueError(
-            f"Unknown model {model_name!r}. Supported: {list(_COST_PER_1K)}"
+            f"Unknown model {model_name!r}. Supported: {list(_MODELS)}"
         )
 
     # ── 1. Cache check ────────────────────────────────────────────────────────
@@ -462,17 +374,12 @@ async def run_single_model(
         http_session = aiohttp.ClientSession()
 
     try:
-        if model_name == "gpt-4o":
-            result = await _call_openai(question)
-        elif model_name == "claude-3-5-sonnet":
-            result = await _call_anthropic(question)
-        else:  # mistral-7b
-            result = await _call_mistral_hf(question, http_session)
+        result = await _call_hf_router(model_name, question, http_session)
     finally:
         if _own_http:
             await http_session.close()
 
-    # Patch question/run IDs that the internal callers leave as 0
+    # Patch question/run IDs that the caller leaves as 0
     result.question_id = question_id
     result.run_id = run_id
 

@@ -77,11 +77,11 @@ class TestModelResult:
         assert r.extra         == {}
 
     @pytest.mark.parametrize("model, tokens, expected", [
-        ("gpt-4o",              1_000,  0.005),
-        ("claude-3-5-sonnet",   1_000,  0.003),
-        ("mistral-7b",          1_000,  0.0002),
-        ("gpt-4o",              0,      0.0),
-        ("unknown-model",       500,    0.0),   # unknown → rate = 0
+        ("llama-3.1-8b",   1_000,  0.0002),
+        ("qwen2.5-72b",    1_000,  0.0008),
+        ("deepseek-v3.2",  1_000,  0.0003),
+        ("llama-3.1-8b",   0,      0.0),
+        ("unknown-model",  500,    0.0),   # unknown → rate = 0
     ])
     def test_cost_computation(self, model: str, tokens: int, expected: float) -> None:
         assert _compute_cost(model, tokens) == pytest.approx(expected, abs=1e-9)
@@ -98,30 +98,35 @@ class TestModelResult:
 class TestRunSingleModel:
 
     @pytest.mark.asyncio
-    async def test_openai_live_path_returns_valid_result(self, db_session: MagicMock) -> None:
-        """API call path: OpenAI client is mocked, result shape is verified."""
-        mock_usage  = MagicMock(prompt_tokens=15, completion_tokens=8)
-        mock_choice = MagicMock()
-        mock_choice.message.content = "The answer is 42."
-        mock_resp   = MagicMock(choices=[mock_choice], usage=mock_usage)
+    async def test_router_live_path_returns_valid_result(self, db_session: MagicMock) -> None:
+        """API call path: HF router HTTP call is mocked, result shape is verified."""
+        # Build a mock aiohttp response for the OpenAI-compatible router.
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.ok = True
+        mock_resp.json = AsyncMock(return_value={
+            "choices": [{"message": {"content": "The answer is 42."}}],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 8},
+        })
+        post_ctx = MagicMock()
+        post_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+        post_ctx.__aexit__  = AsyncMock(return_value=False)
+        mock_http = MagicMock()
+        mock_http.post = MagicMock(return_value=post_ctx)
 
         with patch("src.runners.runner.get_cached_response", return_value=None), \
-             patch("src.runners.runner.set_cached_response"), \
-             patch("src.runners.runner.openai.AsyncOpenAI") as MockCls:
-            instance = AsyncMock()
-            MockCls.return_value = instance
-            instance.chat.completions.create = AsyncMock(return_value=mock_resp)
-
+             patch("src.runners.runner.set_cached_response"):
             result = await run_single_model(
-                model_name="gpt-4o",
+                model_name="llama-3.1-8b",
                 question="What is 6 × 7?",
                 question_id=10,
                 run_id=1,
                 session=db_session,
+                http_session=mock_http,
             )
 
         assert isinstance(result, ModelResult)
-        assert result.model_name     == "gpt-4o"
+        assert result.model_name     == "llama-3.1-8b"
         assert result.question_id    == 10
         assert result.run_id         == 1
         assert result.response_text  == "The answer is 42."
@@ -129,7 +134,7 @@ class TestRunSingleModel:
         assert result.latency_ms     >= 0
         assert result.input_tokens   == 15
         assert result.output_tokens  == 8
-        assert result.cost_usd       == pytest.approx(0.005 * 8 / 1_000, abs=1e-10)
+        assert result.cost_usd       == pytest.approx(0.0002 * 8 / 1_000, abs=1e-10)
         assert result.cache_hit      is False
 
     @pytest.mark.asyncio
@@ -142,18 +147,20 @@ class TestRunSingleModel:
             "output_tokens": 7,
             "cost_usd":      0.000035,
         }
+        mock_http = MagicMock()  # its .post must never be called on a cache hit
+
         with patch("src.runners.runner.get_cached_response", return_value=cached), \
-             patch("src.runners.runner.set_cached_response") as mock_set, \
-             patch("src.runners.runner.openai.AsyncOpenAI")  as MockCls:
+             patch("src.runners.runner.set_cached_response") as mock_set:
 
             result = await run_single_model(
-                model_name="gpt-4o",
+                model_name="llama-3.1-8b",
                 question="What is the capital of France?",
                 question_id=7,
                 run_id=2,
                 session=db_session,
+                http_session=mock_http,
             )
-            MockCls.assert_not_called()
+            mock_http.post.assert_not_called()
             mock_set.assert_not_called()
 
         assert result.cache_hit     is True
