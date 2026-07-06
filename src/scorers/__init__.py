@@ -1,10 +1,53 @@
 """
-Shared types for the scorers package.
+Shared types and judge configuration for the scorers package.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+
+
+def judge_config(default_api_key: str | None = None) -> dict[str, str | None]:
+    """Resolve the LLM-judge settings shared by the RAGAS and DeepEval scorers.
+
+    The judge is the model that grades responses (faithfulness, hallucination,
+    coherence, …); it is independent of the models being benchmarked. Configure
+    it via environment variables so you can swap in a cheaper / higher-rate-limit
+    judge (e.g. ``gpt-4o-mini``) or an OpenAI-compatible endpoint without editing
+    scorer code:
+
+      LLM_JUDGE_MODEL  judge model id            (default ``gpt-4o``)
+      JUDGE_BASE_URL   OpenAI-compatible base URL (default: OpenAI's own)
+      JUDGE_API_KEY    key for that endpoint      (default: OPENAI_API_KEY)
+
+    Note: RAGAS embeddings (answer-relevance) always stay on OpenAI regardless of
+    these settings — the judge base URL may not serve an embeddings endpoint.
+    """
+    api_key = (
+        os.environ.get("JUDGE_API_KEY")
+        or default_api_key
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    return {
+        "model": os.environ.get("LLM_JUDGE_MODEL", "gpt-4o"),
+        "base_url": os.environ.get("JUDGE_BASE_URL") or None,
+        "api_key": api_key,
+    }
+
+
+def judge_max_concurrency() -> int:
+    """Max concurrent judge LLM calls per scorer, from JUDGE_MAX_CONCURRENCY.
+
+    The judge scorers (RAGAS, DeepEval) otherwise fan out many parallel calls
+    (RAGAS defaults to 16 workers), which blows a low OpenAI tokens-per-minute
+    ceiling and triggers 429 retries. Capping concurrency keeps large runs under
+    the TPM limit by design. Default 4; raise it if your tier allows.
+    """
+    try:
+        return max(1, int(os.environ.get("JUDGE_MAX_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
 
 
 @dataclass

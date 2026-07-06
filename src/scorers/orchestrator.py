@@ -26,10 +26,9 @@ Public API
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -159,36 +158,56 @@ class ScoringOrchestrator:
             logger.warning("score_all called with empty inputs list.")
             return ScoringSummary()
 
+        chunk_size = int(os.environ.get("SCORING_CHUNK_SIZE", "40"))
         logger.info(
-            "ScoringOrchestrator: running 3 scorers on %d inputs concurrently…",
+            "ScoringOrchestrator: scoring %d inputs sequentially in chunks of %d "
+            "(memory-bounded, committed per chunk)…",
             len(inputs),
+            chunk_size,
         )
 
-        ragas_task = self.ragas.score(inputs, session)
-        deepeval_task = self.deepeval.score(inputs, session)
-        bert_task = self.bert.score(inputs, session)
+        # Pre-resolve bert_score / transformers imports before scoring.
+        # transformers uses lazy-module imports that are not thread-safe; doing
+        # this once here (single-threaded) avoids an "AutoTokenizer" import race
+        # when BERTScore runs in its worker thread.
+        try:
+            import bert_score  # noqa: F401
+            from transformers import AutoModel, AutoTokenizer  # noqa: F401
+        except Exception as exc:  # pragma: no cover - defensive; both are deps
+            logger.warning("Could not pre-import bert_score/transformers: %s", exc)
 
-        raw_results: tuple[Any, Any, Any] = await asyncio.gather(
-            ragas_task,
-            deepeval_task,
-            bert_task,
-            return_exceptions=True,
+        # Score sequentially, one small chunk at a time, committing each chunk
+        # before the next. This bounds peak memory (only one scorer's working set
+        # on ~chunk_size inputs is live at once) so scoring fits on memory-limited
+        # hosts, and makes progress durable — a crash/OOM loses at most the current
+        # chunk, and already-scored responses are skipped on resume.
+        scorers = (
+            ("BERTScorer", self.bert),
+            ("RAGASScorer", self.ragas),
+            ("DeepEvalScorer", self.deepeval),
         )
-
-        scorer_names = ("RAGASScorer", "DeepEvalScorer", "BERTScorer")
         summary = ScoringSummary(total_inputs=len(inputs))
+        summary.scorer_counts = {name: 0 for name, _ in scorers}
 
-        for name, result in zip(scorer_names, raw_results):
-            if isinstance(result, BaseException):
-                msg = f"{name} raised an unhandled exception: {result}"
-                logger.error(msg, exc_info=result)
-                summary.errors.append(msg)
-                summary.scorer_counts[name] = 0
-            else:
-                count = len(result)
-                summary.scorer_counts[name] = count
-                summary.total_scores_saved += count
-                logger.info("%s: saved %d scores.", name, count)
+        for start in range(0, len(inputs), chunk_size):
+            chunk = inputs[start:start + chunk_size]
+            for name, scorer in scorers:
+                try:
+                    saved = await scorer.score(chunk, session)
+                    summary.scorer_counts[name] += len(saved)
+                    summary.total_scores_saved += len(saved)
+                except Exception as exc:
+                    msg = f"{name} failed on chunk starting at {start}: {exc}"
+                    logger.error(msg, exc_info=True)
+                    summary.errors.append(msg)
+            session.commit()  # durable checkpoint per chunk
+            logger.info(
+                "Scored chunk %d–%d of %d (%d scores so far).",
+                start,
+                min(start + chunk_size, len(inputs)),
+                len(inputs),
+                summary.total_scores_saved,
+            )
 
         logger.info(
             "ScoringOrchestrator complete: %d total scores saved, %d errors.",

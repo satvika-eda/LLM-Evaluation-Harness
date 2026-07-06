@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.cache.cache import cache_stats, get_redis_client
-from src.db import EvalRun, Response, RunStatus, Score, create_tables, get_db
+from src.db import EvalRun, Question, Response, RunStatus, Score, create_tables, get_db
 from src.worker.tasks import run_eval_pipeline
 from src.worker.worker import get_queue
 
@@ -163,11 +163,19 @@ def get_results(run_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
 
 
 @app.get("/leaderboard")
-def leaderboard(db: Session = Depends(get_db)) -> dict[str, Any]:
+def leaderboard(dataset: str | None = None, db: Session = Depends(get_db)) -> dict[str, Any]:
     """
     Return all models ranked by average faithfulness score (descending).
 
     Each entry includes all metric averages and average cost per question.
+
+    Query params
+    ------------
+    dataset : optional dataset name (e.g. "hotpotqa"). When given, only scores
+              and costs from responses to that dataset's questions are counted.
+              Omit to aggregate across all datasets. Filtering by dataset avoids
+              blending metrics that are dataset-dependent — e.g. faithfulness is
+              ~0 on context-free TruthfulQA but meaningful on HotpotQA.
 
     Response shape
     --------------
@@ -175,7 +183,7 @@ def leaderboard(db: Session = Depends(get_db)) -> dict[str, Any]:
         "leaderboard": [
             {
                 "rank": 1,
-                "model": "gpt-4o",
+                "model": "llama-3.1-8b",
                 "avg_faithfulness": 0.92,
                 "avg_cost_per_question": 0.0031,
                 "metrics": {
@@ -190,21 +198,29 @@ def leaderboard(db: Session = Depends(get_db)) -> dict[str, Any]:
     """
     _FAITHFULNESS = "ragas/faithfulness"
 
-    score_rows = (
+    score_q = (
         db.query(Response.model_name, Score.metric_name, Score.score)
         .join(Score, Score.response_id == Response.id)
-        .all()
     )
+    cost_q = (
+        db.query(Response.model_name, Response.cost_usd)
+        .filter(Response.cost_usd.isnot(None))
+    )
+    if dataset:
+        score_q = score_q.join(Question, Question.id == Response.question_id).filter(
+            Question.dataset_name == dataset
+        )
+        cost_q = cost_q.join(Question, Question.id == Response.question_id).filter(
+            Question.dataset_name == dataset
+        )
+
+    score_rows = score_q.all()
 
     metric_scores: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for model_name, metric_name, score in score_rows:
         metric_scores[model_name][metric_name].append(score)
 
-    cost_rows = (
-        db.query(Response.model_name, Response.cost_usd)
-        .filter(Response.cost_usd.isnot(None))
-        .all()
-    )
+    cost_rows = cost_q.all()
     cost_lists: dict[str, list[float]] = defaultdict(list)
     for model_name, cost in cost_rows:
         cost_lists[model_name].append(cost)

@@ -29,13 +29,14 @@ Notes on DeepEval API
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from src.scorers import ScoringInput
+from src.scorers import ScoringInput, judge_max_concurrency
 from src.scorers.ragas_scorer import _persist_scores
 
 logger = logging.getLogger(__name__)
@@ -54,18 +55,24 @@ class DeepEvalScorer:
 
     def _get_model(self) -> Any:
         """
-        Return a GPTModel configured for logprobs scoring.
+        Return the judge model used by HallucinationMetric and GEval.
 
-        logprobs=True enables DeepEval's weighted probability aggregation in
-        GEval, which is more stable than sampling a single verdict token.
-        top_logprobs=5 gives sufficient probability mass for scoring.
+        The judge (model id, base URL, API key) is configured via environment
+        variables — see ``src.scorers.judge_config`` — so it can be swapped for
+        a cheaper / higher-rate-limit model (e.g. ``gpt-4o-mini``) or an
+        OpenAI-compatible endpoint without touching this code. Defaults to
+        GPT-4o via OpenAI.
         """
         if self._model is None:
             from deepeval.models import GPTModel
 
+            from src.scorers import judge_config
+
+            cfg = judge_config(self._api_key)
             self._model = GPTModel(
-                model="gpt-4o",
-                _openai_api_key=self._api_key,
+                model=cfg["model"],
+                _openai_api_key=cfg["api_key"],
+                base_url=cfg["base_url"],
             )
         return self._model
 
@@ -136,20 +143,28 @@ class DeepEvalScorer:
         return scores
 
     async def _score_all(self, inputs: list[ScoringInput]) -> list[dict[str, float]]:
-        """Run both metrics over every input sequentially in the event loop."""
-        results: list[dict[str, float]] = []
-        for inp in inputs:
-            try:
-                results.append(await self._score_single(inp))
-            except Exception as exc:
-                logger.error(
-                    "DeepEvalScorer failed for response_id=%d: %s",
-                    inp.response_id,
-                    exc,
-                    exc_info=True,
-                )
-                results.append({})
-        return results
+        """Score every input, capped at judge_max_concurrency() in flight.
+
+        A semaphore bounds how many responses are judged at once so bursts of
+        judge LLM calls stay under the OpenAI tokens-per-minute ceiling. Results
+        preserve input order; a per-input failure yields an empty score dict.
+        """
+        sem = asyncio.Semaphore(judge_max_concurrency())
+
+        async def _one(inp: ScoringInput) -> dict[str, float]:
+            async with sem:
+                try:
+                    return await self._score_single(inp)
+                except Exception as exc:
+                    logger.error(
+                        "DeepEvalScorer failed for response_id=%d: %s",
+                        inp.response_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    return {}
+
+        return await asyncio.gather(*(_one(inp) for inp in inputs))
 
     # ── Public async interface ────────────────────────────────────────────────
 

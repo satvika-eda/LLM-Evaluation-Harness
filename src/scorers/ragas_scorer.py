@@ -92,8 +92,16 @@ class RAGASScorer:
             from langchain_openai import ChatOpenAI
             from ragas.llms import LangchainLLMWrapper
 
+            from src.scorers import judge_config
+
+            cfg = judge_config(self._api_key)
             self._llm = LangchainLLMWrapper(
-                ChatOpenAI(model="gpt-4o", api_key=self._api_key, temperature=0)
+                ChatOpenAI(
+                    model=cfg["model"],
+                    api_key=cfg["api_key"],
+                    base_url=cfg["base_url"],
+                    temperature=0,
+                )
             )
         return self._llm
 
@@ -119,9 +127,16 @@ class RAGASScorer:
         """
         from ragas import EvaluationDataset, SingleTurnSample, evaluate
         from ragas.metrics import ContextRecall, Faithfulness, ResponseRelevancy
+        from ragas.run_config import RunConfig
+
+        from src.scorers import judge_max_concurrency
 
         llm = self._get_llm()
         embeddings = self._get_embeddings()
+
+        # Cap RAGAS's internal parallelism so bursts of judge calls stay under
+        # the OpenAI tokens-per-minute ceiling (default max_workers is 16).
+        run_config = RunConfig(max_workers=judge_max_concurrency())
 
         faithfulness_metric = Faithfulness(llm=llm)
         relevancy_metric = ResponseRelevancy(llm=llm, embeddings=embeddings)
@@ -152,6 +167,7 @@ class RAGASScorer:
             result = evaluate(
                 dataset,
                 metrics=[faithfulness_metric, relevancy_metric, recall_metric],
+                run_config=run_config,
             )
             for batch_pos, (orig_idx, _) in enumerate(with_context):
                 row: dict[str, Any] = result.scores[batch_pos]
@@ -176,6 +192,7 @@ class RAGASScorer:
             result = evaluate(
                 dataset,
                 metrics=[faithfulness_metric, relevancy_metric],
+                run_config=run_config,
             )
             for batch_pos, (orig_idx, _) in enumerate(no_context):
                 row = result.scores[batch_pos]

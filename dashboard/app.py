@@ -67,8 +67,9 @@ LOWER_IS_BETTER: set[str] = {"deepeval/hallucination"}
 # ── API helpers ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_leaderboard() -> list[dict]:
-    resp = requests.get(f"{FASTAPI_URL}/leaderboard", timeout=10)
+def fetch_leaderboard(dataset: str | None = None) -> list[dict]:
+    params = {"dataset": dataset} if dataset else None
+    resp = requests.get(f"{FASTAPI_URL}/leaderboard", params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()["leaderboard"]
 
@@ -94,16 +95,22 @@ def fetch_results(run_id: int) -> dict:
     return resp.json()["results"]
 
 
-def fetch_aggregate_scores() -> dict[str, dict[str, list[float]]]:
+def fetch_aggregate_scores(dataset: str | None = None) -> dict[str, dict[str, list[float]]]:
     """
     Walk all completed runs and aggregate per-run metric averages.
     Returns {model: {metric: [avg_from_run_1, avg_from_run_2, ...]}}
     so the caller can compute cross-run mean and std-dev.
+
+    When ``dataset`` is given, only runs on that dataset are included, so
+    dataset-dependent metrics (faithfulness, context-recall) aren't blended
+    across datasets that do and don't ship context.
     """
     runs = fetch_runs()
     agg: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for run in runs:
         if run.get("status") != "completed":
+            continue
+        if dataset and run.get("dataset_name") != dataset:
             continue
         try:
             results = fetch_results(run["id"])
@@ -133,11 +140,28 @@ st.set_page_config(
 st.title("🧪 LLM Evaluation Harness")
 st.caption(f"Connected to backend: `{FASTAPI_URL}`")
 
+# ── Dataset filter (applies to Leaderboard, Cost vs Quality, Metric Explorer) ──
+# Faithfulness and context-recall are only meaningful on datasets that ship
+# retrieval context (HotpotQA); scoping by dataset avoids blending them with a
+# context-free dataset (TruthfulQA) where they read as ~0.
+_DATASET_FILTER_OPTIONS = ["__all__", *KNOWN_DATASETS]
+selected_dataset = st.selectbox(
+    "Dataset filter",
+    options=_DATASET_FILTER_OPTIONS,
+    format_func=lambda d: "All datasets" if d == "__all__" else DATASET_LABELS.get(d, d),
+    help=(
+        "Scope the aggregate views to one dataset. Faithfulness and context "
+        "recall are only meaningful on datasets with context (HotpotQA)."
+    ),
+    key="dataset_filter",
+)
+dataset_filter: str | None = None if selected_dataset == "__all__" else selected_dataset
+
 # Pre-fetch leaderboard data (shared between tab 1 and tab 2)
 leaderboard_data: list[dict] = []
 leaderboard_error: str | None = None
 try:
-    leaderboard_data = fetch_leaderboard()
+    leaderboard_data = fetch_leaderboard(dataset_filter)
 except Exception as exc:
     leaderboard_error = str(exc)
 
@@ -295,7 +319,7 @@ with tab_me:
     agg_error: str | None = None
     agg_scores: dict[str, dict[str, list[float]]] = {}
     try:
-        agg_scores = fetch_aggregate_scores()
+        agg_scores = fetch_aggregate_scores(dataset_filter)
     except Exception as exc:
         agg_error = str(exc)
 
