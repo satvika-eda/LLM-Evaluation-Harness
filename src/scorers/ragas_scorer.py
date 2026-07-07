@@ -1,13 +1,24 @@
 """
-RAGAS scorer — faithfulness, answer_relevance, context_recall.
+RAGAS scorer — faithfulness and answer_relevance.
 
 Uses GPT-4o as the judge LLM via LangChain's OpenAI wrapper.
 
 Metric names written to the DB
 -------------------------------
-    ragas/faithfulness
+    ragas/faithfulness       (skipped when context is empty, e.g. TruthfulQA —
+                              faithfulness grades the answer's claims against
+                              the retrieved context, which is undefined
+                              without one)
     ragas/answer_relevance
-    ragas/context_recall     (skipped when context is empty, e.g. TruthfulQA)
+
+context_recall was removed deliberately: it compares the ground truth against
+the retrieved context and never looks at the model's answer, so with a fixed
+dataset every model gets an identical score — it measures the dataset, not
+the model. It only becomes meaningful with a real retrieval pipeline where
+contexts vary per run.
+
+Failed or NaN judge scores are omitted from the result dict (never coerced
+to 0.0), so they can't poison AVG() aggregates in the DB.
 
 Notes on RAGAS dataset schema (>=0.2)
 --------------------------------------
@@ -122,11 +133,12 @@ class RAGASScorer:
         Run RAGAS evaluate() synchronously over a batch of inputs.
 
         Returns a list parallel to `inputs`, each element being a dict of
-        {metric_name: score}. Missing metrics (e.g. context_recall for
-        TruthfulQA) are absent from the dict rather than set to 0.
+        {metric_name: score}. Metrics that are inapplicable (faithfulness
+        without context) or whose judge call failed (NaN) are absent from
+        the dict rather than coerced to 0.
         """
         from ragas import EvaluationDataset, SingleTurnSample, evaluate
-        from ragas.metrics import ContextRecall, Faithfulness, ResponseRelevancy
+        from ragas.metrics import Faithfulness, ResponseRelevancy
         from ragas.run_config import RunConfig
 
         from src.scorers import judge_max_concurrency
@@ -140,11 +152,11 @@ class RAGASScorer:
 
         faithfulness_metric = Faithfulness(llm=llm)
         relevancy_metric = ResponseRelevancy(llm=llm, embeddings=embeddings)
-        recall_metric = ContextRecall(llm=llm)
 
-        # Split inputs into those with / without context so we can run two
-        # separate evaluate() calls rather than making context_recall handle
-        # empty strings (which would produce NaN).
+        # Split inputs into those with / without context. Faithfulness is only
+        # defined against a non-empty context: with an empty one, no claim can
+        # ever be supported, so every answer would score ~0 regardless of
+        # quality. No-context rows get answer_relevance only.
         with_context: list[tuple[int, ScoringInput]] = []
         no_context: list[tuple[int, ScoringInput]] = []
         for idx, inp in enumerate(inputs):
@@ -152,7 +164,7 @@ class RAGASScorer:
 
         results: list[dict[str, float]] = [{} for _ in inputs]
 
-        # ── Batch with context (faithfulness + relevancy + recall) ────────────
+        # ── Batch with context (faithfulness + relevancy) ─────────────────────
         if with_context:
             samples = [
                 SingleTurnSample(
@@ -166,24 +178,25 @@ class RAGASScorer:
             dataset = EvaluationDataset(samples=samples)
             result = evaluate(
                 dataset,
-                metrics=[faithfulness_metric, relevancy_metric, recall_metric],
+                metrics=[faithfulness_metric, relevancy_metric],
                 run_config=run_config,
             )
             for batch_pos, (orig_idx, _) in enumerate(with_context):
                 row: dict[str, Any] = result.scores[batch_pos]
-                results[orig_idx] = {
-                    f"{_METRIC_PREFIX}/faithfulness":    float(row.get("faithfulness", 0.0)),
-                    f"{_METRIC_PREFIX}/answer_relevance": float(row.get("answer_relevancy", 0.0)),
-                    f"{_METRIC_PREFIX}/context_recall":  float(row.get("context_recall", 0.0)),
-                }
+                results[orig_idx] = _clean_metric_map(
+                    {
+                        f"{_METRIC_PREFIX}/faithfulness":     row.get("faithfulness"),
+                        f"{_METRIC_PREFIX}/answer_relevance": row.get("answer_relevancy"),
+                    }
+                )
 
-        # ── Batch without context (faithfulness + relevancy only) ─────────────
+        # ── Batch without context (relevancy only) ────────────────────────────
         if no_context:
             samples = [
                 SingleTurnSample(
                     user_input=inp.question,
                     response=inp.response_text,
-                    retrieved_contexts=[""],
+                    retrieved_contexts=[""],  # required field; unused by relevancy
                     reference=inp.ground_truth,
                 )
                 for _, inp in no_context
@@ -191,16 +204,14 @@ class RAGASScorer:
             dataset = EvaluationDataset(samples=samples)
             result = evaluate(
                 dataset,
-                metrics=[faithfulness_metric, relevancy_metric],
+                metrics=[relevancy_metric],
                 run_config=run_config,
             )
             for batch_pos, (orig_idx, _) in enumerate(no_context):
                 row = result.scores[batch_pos]
-                results[orig_idx] = {
-                    f"{_METRIC_PREFIX}/faithfulness":    float(row.get("faithfulness", 0.0)),
-                    f"{_METRIC_PREFIX}/answer_relevance": float(row.get("answer_relevancy", 0.0)),
-                    # context_recall intentionally omitted for no-context rows
-                }
+                results[orig_idx] = _clean_metric_map(
+                    {f"{_METRIC_PREFIX}/answer_relevance": row.get("answer_relevancy")}
+                )
 
         return results
 
@@ -239,7 +250,35 @@ class RAGASScorer:
         return _persist_scores(metric_maps, inputs, session, "RAGASScorer")
 
 
-# ── Shared persistence helper (used by all three scorer modules) ──────────────
+# ── Shared helpers (used by all three scorer modules) ─────────────────────────
+
+def _clean_metric_map(raw: dict[str, Any]) -> dict[str, float]:
+    """
+    Drop missing/NaN judge scores instead of coercing them to numbers.
+
+    RAGAS returns NaN for samples where the judge call or output parsing
+    failed. A NaN stored in Postgres poisons any AVG() over the column, and
+    coercing a missing value to 0.0 is indistinguishable from a genuine
+    zero — both silently corrupt aggregates. Omitting the metric leaves an
+    honest gap that per-metric COUNT() makes visible.
+    """
+    import math
+
+    cleaned: dict[str, float] = {}
+    for name, val in raw.items():
+        if val is None:
+            continue
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            logger.warning("Non-numeric judge score for %s: %r — dropped.", name, val)
+            continue
+        if math.isnan(f):
+            logger.warning("NaN judge score for %s — dropped.", name)
+            continue
+        cleaned[name] = f
+    return cleaned
+
 
 def _persist_scores(
     metric_maps: list[dict[str, float]],
@@ -252,12 +291,28 @@ def _persist_scores(
 
     Imported and reused by deepeval_scorer and bert_scorer to avoid
     duplicating the DB write logic.
+
+    Skips (response_id, metric_name) pairs that already exist so a resumed
+    run never double-counts previously committed chunks — the scores table
+    also enforces this with a unique constraint, but skipping here keeps
+    resume from aborting the whole flush.
     """
     from src.db import Score
 
+    response_ids = {inp.response_id for inp in inputs}
+    existing: set[tuple[int, str]] = set(
+        session.query(Score.response_id, Score.metric_name)
+        .filter(Score.response_id.in_(response_ids))
+        .all()
+    )
+
     records: list[dict[str, Any]] = []
+    skipped = 0
     for inp, metric_map in zip(inputs, metric_maps):
         for metric_name, score_val in metric_map.items():
+            if (inp.response_id, metric_name) in existing:
+                skipped += 1
+                continue
             row = Score(
                 response_id=inp.response_id,
                 metric_name=metric_name,
@@ -273,5 +328,9 @@ def _persist_scores(
             )
 
     session.flush()
+    if skipped:
+        logger.info(
+            "%s: skipped %d already-persisted scores (resume).", scorer_label, skipped
+        )
     logger.debug("%s: persisted %d score rows.", scorer_label, len(records))
     return records

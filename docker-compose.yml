@@ -53,6 +53,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    mem_limit: 1g
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 10s
@@ -75,11 +76,25 @@ services:
       ANTHROPIC_API_KEY:   ${ANTHROPIC_API_KEY:-}
       HUGGINGFACE_API_KEY: ${HUGGINGFACE_API_KEY:-}
       LOG_LEVEL:           ${LOG_LEVEL:-INFO}
+      # Judge / memory knobs — the worker is where scoring actually runs,
+      # so these MUST be passed through or the judge silently defaults to
+      # full gpt-4o and BERTScore to the 3.5 GB DeBERTa-xlarge model.
+      LLM_JUDGE_MODEL:       ${LLM_JUDGE_MODEL:-gpt-4o-mini}
+      JUDGE_BASE_URL:        ${JUDGE_BASE_URL:-}
+      JUDGE_API_KEY:         ${JUDGE_API_KEY:-}
+      JUDGE_MAX_CONCURRENCY: ${JUDGE_MAX_CONCURRENCY:-2}
+      SCORING_CHUNK_SIZE:    ${SCORING_CHUNK_SIZE:-10}
+      BERTSCORE_MODEL:       ${BERTSCORE_MODEL:-roberta-large}
+      CACHE_TTL_SECONDS:     ${CACHE_TTL_SECONDS:-604800}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Hard ceiling so a scoring spike OOM-kills only this container instead
+    # of thrashing the whole 8 GB host. RQ marks the job failed; the run can
+    # be re-submitted and resumes from cached generations + saved scores.
+    mem_limit: 4g
     restart: unless-stopped
 
   # ── Streamlit Dashboard ─────────────────────────────────────────────────────

@@ -1,9 +1,13 @@
 """
 BERTScore scorer — precision, recall, F1.
 
-Uses microsoft/deberta-xlarge-mnli as the embedding model, which
-consistently outranks BERT/RoBERTa on WMT and summarisation benchmarks
-because DeBERTa's disentangled attention better captures token importance.
+The embedding model is configurable via the BERTSCORE_MODEL env var.
+Default is microsoft/deberta-xlarge-mnli (~900M params, ~3.5 GB RAM in
+fp32 on CPU), which consistently outranks BERT/RoBERTa on WMT and
+summarisation benchmarks. On memory-constrained hosts (≤8 GB) set
+BERTSCORE_MODEL=roberta-large (~1.4 GB, the bert-score default for
+English) — scores are not comparable across embedding models, so pick
+one and keep it for a whole benchmark.
 
 Metric names written to the DB
 -------------------------------
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -35,8 +40,13 @@ from src.scorers.ragas_scorer import _persist_scores
 
 logger = logging.getLogger(__name__)
 
-_MODEL_TYPE = "microsoft/deberta-xlarge-mnli"
+_DEFAULT_MODEL_TYPE = "microsoft/deberta-xlarge-mnli"
 _METRIC_PREFIX = "bertscore"
+
+
+def _model_type() -> str:
+    """Embedding model for BERTScore; override with BERTSCORE_MODEL."""
+    return os.environ.get("BERTSCORE_MODEL", _DEFAULT_MODEL_TYPE)
 
 
 class BERTScorer:
@@ -59,20 +69,24 @@ class BERTScorer:
         """
         Load DeBERTa-xlarge-mnli once and cache it on self._scorer.
 
-        rescale_with_baseline=True maps raw cosine similarities onto a
-        [0, 1] range calibrated against human judgements, making scores
-        directly comparable across models and datasets.
+        rescale_with_baseline=True re-centres raw cosine similarities
+        against a per-language baseline so scores spread over a wider,
+        more interpretable range. Rescaled scores are NOT bounded to
+        [0, 1] — texts less similar than the baseline (e.g. short answers
+        vs long references) come out negative. Downstream consumers must
+        not assume a unit interval for bertscore/* metrics.
         """
         if self._scorer is None:
             from bert_score import BERTScorer as _BERTScorer
 
+            model_type = _model_type()
             logger.info(
                 "Loading BERTScorer model %s on %s (first call only)…",
-                _MODEL_TYPE,
+                model_type,
                 self._device,
             )
             self._scorer = _BERTScorer(
-                model_type=_MODEL_TYPE,
+                model_type=model_type,
                 device=self._device,
                 lang="en",
                 rescale_with_baseline=True,

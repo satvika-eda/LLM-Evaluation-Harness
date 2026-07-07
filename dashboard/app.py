@@ -41,7 +41,6 @@ DATASET_LABELS: dict[str, str] = {
 ALL_METRICS: list[str] = [
     "ragas/faithfulness",
     "ragas/answer_relevance",
-    "ragas/context_recall",
     "deepeval/hallucination",
     "deepeval/coherence",
     "bertscore/precision",
@@ -52,7 +51,6 @@ ALL_METRICS: list[str] = [
 METRIC_LABELS: dict[str, str] = {
     "ragas/faithfulness": "Faithfulness (RAGAS)",
     "ragas/answer_relevance": "Answer Relevance (RAGAS)",
-    "ragas/context_recall": "Context Recall (RAGAS)",
     "deepeval/hallucination": "Hallucination (DeepEval)",
     "deepeval/coherence": "Coherence (DeepEval)",
     "bertscore/precision": "BERTScore Precision",

@@ -26,10 +26,11 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     Enum as SAEnum,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 load_dotenv()
 
@@ -99,7 +100,14 @@ class EvalRun(Base):
     # PostgreSQL native array; stores model IDs as text[]
     models_evaluated: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
     status: Mapped[str] = mapped_column(
-        SAEnum(RunStatus, name="run_status", create_type=True),
+        SAEnum(
+            RunStatus,
+            name="run_status",
+            create_type=True,
+            # Store the lowercase enum values ("pending"), not the member
+            # names ("PENDING"), so raw SQL like status = 'pending' works.
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
         default=RunStatus.PENDING,
     )
@@ -133,6 +141,9 @@ class Question(Base):
     """
 
     __tablename__ = "questions"
+    __table_args__ = (
+        UniqueConstraint("dataset_name", "question", name="uq_question_dataset_text"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     dataset_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
@@ -155,9 +166,18 @@ class Response(Base):
 
     Stores runtime telemetry (latency, token counts, cost) alongside the text
     so aggregate performance statistics can be queried directly from the DB.
+
+    Failed calls are persisted too (response_text="" and error set) so a
+    model's completion rate is queryable — otherwise a flaky model would
+    simply have fewer rows and identical-looking averages.
     """
 
     __tablename__ = "responses"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "question_id", "model_name", name="uq_response_run_question_model"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(
@@ -172,6 +192,8 @@ class Response(Base):
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cache_hit: Mapped[bool] = mapped_column(nullable=False, default=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -200,6 +222,9 @@ class Score(Base):
     """
 
     __tablename__ = "scores"
+    __table_args__ = (
+        UniqueConstraint("response_id", "metric_name", name="uq_score_response_metric"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     response_id: Mapped[int] = mapped_column(

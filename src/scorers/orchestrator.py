@@ -1,9 +1,10 @@
 """
 Scoring orchestrator for the LLM evaluation harness.
 
-Runs RAGASScorer, DeepEvalScorer, and BERTScorer concurrently over a list
-of model response records using asyncio.gather, then persists all scores
-to the PostgreSQL scores table.
+Runs RAGASScorer, DeepEvalScorer, and BERTScorer sequentially over the
+inputs in small chunks, committing after each chunk so progress is durable
+and peak memory stays bounded. Already-persisted (response_id, metric_name)
+pairs are skipped, so a crashed run can be resumed without double-counting.
 
 Typical call site (inside an eval loop)
 -----------------------------------------
@@ -14,9 +15,9 @@ Typical call site (inside an eval loop)
     # Build ScoringInputs from joined Response + Question rows
     inputs = orchestrator.build_inputs(responses, questions_by_id)
 
-    async with async_session() as session:
+    with SessionLocal() as session:
         summary = await orchestrator.score_all(inputs, session)
-        session.commit()
+        # score_all commits per chunk; no final commit needed for scores
 
 Public API
 ----------
@@ -137,18 +138,19 @@ class ScoringOrchestrator:
         session: Session,
     ) -> ScoringSummary:
         """
-        Run all three scorers concurrently and save results to the DB.
+        Run all three scorers over the inputs in chunks and save to the DB.
 
-        Each scorer receives the full input list and writes independently
-        to the scores table. asyncio.gather is used with
-        return_exceptions=True so a failure in one scorer does not cancel
-        the others.
+        Scorers run sequentially per chunk; a failure in one scorer is
+        logged and recorded in the summary without cancelling the others.
+        This method commits after every chunk (durable checkpoints);
+        already-persisted (response_id, metric_name) pairs are skipped so
+        resuming after a crash never double-counts.
 
         Parameters
         ----------
         inputs  : list[ScoringInput] — build with build_inputs()
-        session : active SQLAlchemy Session; caller is responsible for
-                  committing after this method returns
+        session : active SQLAlchemy Session; commits happen per chunk
+                  inside this method
 
         Returns
         -------

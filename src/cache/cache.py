@@ -1,21 +1,24 @@
 """
 Redis cache layer for the LLM evaluation harness.
 
-Caches model responses by (question_id, model_name) to avoid redundant and
-costly inference calls when re-running or extending an evaluation.
+Caches model responses by a content-addressed key (a hash of the full prompt,
+model id, and generation params — computed by the runner) to avoid redundant
+and costly inference calls when re-running or extending an evaluation.
 
 Key format
 ----------
-    response:{question_id}:{model_name}
+    response:{cache_key}:{model_name}
 
-    e.g. response:42:gpt-4o
-         response:42:claude-3-5-sonnet
+    where cache_key is a sha256 hex digest built by the runner. Content
+    addressing means a DB reset, prompt-template change, or model remap
+    can never serve a stale generation for the wrong question — the old
+    DB-PK-based keys could.
 
 Public API
 ----------
     get_redis_client()                                    -> Redis
-    get_cached_response(question_id, model_name)          -> dict | None
-    set_cached_response(question_id, model_name,
+    get_cached_response(cache_key, model_name)            -> dict | None
+    set_cached_response(cache_key, model_name,
                         response_dict, ttl)               -> bool
     cache_stats()                                         -> dict
 """
@@ -34,7 +37,22 @@ from redis import Redis
 logger = logging.getLogger(__name__)
 
 _KEY_PREFIX = "response"
-_DEFAULT_TTL = 86_400  # 24 hours in seconds
+
+
+def _default_ttl() -> int:
+    """
+    Cache TTL in seconds; override with CACHE_TTL_SECONDS.
+
+    Defaults to 7 days. Generations are the expensive artifact — when a
+    daily judge-quota limit forces a run to be split across days, a short
+    TTL would expire the paid generations right before the follow-up run
+    needs them. Keys are content-addressed, so a long TTL can never serve
+    a wrong answer — only a stale-but-identical one.
+    """
+    try:
+        return int(os.environ.get("CACHE_TTL_SECONDS", str(7 * 86_400)))
+    except ValueError:
+        return 7 * 86_400
 
 
 # ── Client factory ────────────────────────────────────────────────────────────
@@ -61,20 +79,26 @@ def get_redis_client() -> Redis:
     url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     client: Redis = redis.from_url(url, decode_responses=True)
     client.ping()  # fail fast if unreachable
-    logger.info("Redis client connected to %s", url)
+    # Log host:port only — REDIS_URL may embed a password (redis://:pw@host).
+    pool_kwargs = client.connection_pool.connection_kwargs
+    logger.info(
+        "Redis client connected to %s:%s",
+        pool_kwargs.get("host", "?"),
+        pool_kwargs.get("port", "?"),
+    )
     return client
 
 
 # ── Key helper ────────────────────────────────────────────────────────────────
 
-def _make_key(question_id: int | str, model_name: str) -> str:
-    return f"{_KEY_PREFIX}:{question_id}:{model_name}"
+def _make_key(cache_key: int | str, model_name: str) -> str:
+    return f"{_KEY_PREFIX}:{cache_key}:{model_name}"
 
 
 # ── Cache operations ──────────────────────────────────────────────────────────
 
 def get_cached_response(
-    question_id: int | str,
+    cache_key: int | str,
     model_name: str,
 ) -> dict[str, Any] | None:
     """
@@ -82,17 +106,18 @@ def get_cached_response(
 
     Parameters
     ----------
-    question_id:
-        Primary key of the question row (int) or any stable string identifier.
+    cache_key:
+        Content-addressed identifier for the generation (the runner passes a
+        sha256 digest of prompt + model id + generation params).
     model_name:
-        Model identifier string, e.g. "gpt-4o" or "claude-3-5-sonnet".
+        Canonical model identifier (kept in the key for debuggability).
 
     Returns
     -------
     The deserialized response dict if the key exists and has not expired,
     otherwise None.
     """
-    key = _make_key(question_id, model_name)
+    key = _make_key(cache_key, model_name)
     try:
         raw = get_redis_client().get(key)
     except redis.RedisError as exc:
@@ -114,33 +139,36 @@ def get_cached_response(
 
 
 def set_cached_response(
-    question_id: int | str,
+    cache_key: int | str,
     model_name: str,
     response_dict: dict[str, Any],
-    ttl: int = _DEFAULT_TTL,
+    ttl: int | None = None,
 ) -> bool:
     """
     Serialize and store a response dict in Redis.
 
     Parameters
     ----------
-    question_id:
-        Primary key or stable identifier for the question.
+    cache_key:
+        Content-addressed identifier for the generation (see get_cached_response).
     model_name:
         Model identifier string.
     response_dict:
         Arbitrary JSON-serializable dict. Typically contains keys such as
         response_text, latency_ms, input_tokens, output_tokens, cost_usd.
     ttl:
-        Time-to-live in seconds. Defaults to 86 400 (24 hours).
-        Pass ttl=0 to store without expiry (not recommended for prod).
+        Time-to-live in seconds. None (default) uses CACHE_TTL_SECONDS
+        (7 days if unset). Pass ttl=0 to store without expiry (not
+        recommended for prod).
 
     Returns
     -------
     True on success, False if the write failed (Redis error is logged but
     not re-raised so callers don't need try/except for every inference call).
     """
-    key = _make_key(question_id, model_name)
+    if ttl is None:
+        ttl = _default_ttl()
+    key = _make_key(cache_key, model_name)
     try:
         serialized = json.dumps(response_dict, default=str)
     except (TypeError, ValueError) as exc:

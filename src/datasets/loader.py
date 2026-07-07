@@ -135,7 +135,8 @@ def load_hotpotqa(split: str = "validation", n: int | None = None) -> list[dict]
     Parameters
     ----------
     split:
-        HuggingFace split name — "train", "validation", or "test".
+        HuggingFace split name — "train" or "validation" (the distractor
+        config has no test split).
         Defaults to "validation" (7 410 rows) to avoid pulling 90k rows.
     n:
         If given, return at most n questions from the head of the split.
@@ -210,34 +211,40 @@ def save_questions_to_db(
         transactions.
     skip_duplicates:
         When True (default), questions whose (dataset_name, question) pair
-        already exists in the DB are silently skipped. When False, they are
-        inserted again (useful for tests with isolated transactions).
+        already exists in the DB are reused rather than re-inserted. When
+        False, they are inserted again (useful for tests with isolated
+        transactions).
 
     Returns
     -------
-    list[Question] — the ORM objects that were actually added to the session
-    (does not include skipped duplicates).
+    list[Question] — one ORM object per input dict, in input order:
+    the pre-existing row when the question was already in the DB, the
+    newly inserted row otherwise. Callers can therefore run exactly the
+    set of questions they loaded/sampled, instead of re-querying the
+    table (which would return an arbitrary subset once the table holds
+    more rows than requested).
     """
     if not questions:
         return []
 
-    added: list[Question] = []
-
-    # Build a set of existing (dataset_name, question) pairs in one query
-    # so we don't hit the DB once per row in the loop.
-    existing: set[tuple[str, str]] = set()
+    # Map existing (dataset_name, question) pairs to their ORM rows in one
+    # query so we don't hit the DB once per row in the loop.
+    existing: dict[tuple[str, str], Question] = {}
     if skip_duplicates:
         dataset_names = {q["dataset_name"] for q in questions}
         rows = (
-            session.query(Question.dataset_name, Question.question)
+            session.query(Question)
             .filter(Question.dataset_name.in_(dataset_names))
             .all()
         )
-        existing = {(r.dataset_name, r.question) for r in rows}
+        existing = {(r.dataset_name, r.question): r for r in rows}
 
+    result: list[Question] = []
+    added = 0
     for q in questions:
         key = (q["dataset_name"], q["question"])
         if skip_duplicates and key in existing:
+            result.append(existing[key])
             continue
 
         obj = Question(
@@ -247,12 +254,13 @@ def save_questions_to_db(
             context=q["context"] or None,  # store empty string as NULL
         )
         session.add(obj)
-        added.append(obj)
+        result.append(obj)
+        added += 1
 
     session.flush()  # assign IDs without committing the transaction
     logger.info(
-        "Saved %d questions to DB (%d skipped as duplicates).",
-        len(added),
-        len(questions) - len(added),
+        "Saved %d questions to DB (%d reused as duplicates).",
+        added,
+        len(questions) - added,
     )
-    return added
+    return result

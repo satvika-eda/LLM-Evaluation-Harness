@@ -20,14 +20,26 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.cache.cache import cache_stats, get_redis_client
 from src.db import EvalRun, Question, Response, RunStatus, Score, create_tables, get_db
-from src.worker.tasks import run_eval_pipeline
+from src.runners.runner import _MODELS
 from src.worker.worker import get_queue
+
+# The pipeline is enqueued by dotted-path string (see run_eval below) rather
+# than imported: importing src.worker.tasks would drag the datasets/langchain
+# scorer stack into the API process, costing several hundred MB of RAM for
+# code the API never executes.
+_PIPELINE_TASK = "src.worker.tasks.run_eval_pipeline"
+
+# Dataset names duplicated from src.datasets.loader for the same reason
+# (loader imports the HuggingFace `datasets` library at module level).
+TRUTHFULQA_NAME = "truthfulqa"
+HOTPOTQA_NAME = "hotpotqa"
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +84,34 @@ class RunEvalRequest(BaseModel):
 # Routes
 # ---------------------------------------------------------------------------
 
+_SUPPORTED_DATASETS = {TRUTHFULQA_NAME, HOTPOTQA_NAME}
+
+
 @app.post("/run-eval", status_code=201)
 def run_eval(req: RunEvalRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     """
     Create an eval_run record with status PENDING, enqueue the pipeline job
     to RQ on the "eval_jobs" queue, and return run_id + job_id immediately.
+
+    Rejects unknown datasets/models up front (400) so a typo can't burn a
+    worker slot, and marks the run FAILED if the enqueue itself fails so no
+    permanently-PENDING ghost row is left behind.
     """
+    if req.dataset_name not in _SUPPORTED_DATASETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown dataset {req.dataset_name!r}. "
+                   f"Supported: {sorted(_SUPPORTED_DATASETS)}",
+        )
+    unknown_models = [m for m in req.models if m not in _MODELS]
+    if unknown_models:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model(s) {unknown_models!r}. Supported: {list(_MODELS)}",
+        )
+    if req.n_questions < 1:
+        raise HTTPException(status_code=400, detail="n_questions must be >= 1")
+
     run = EvalRun(
         run_name=req.run_name,
         dataset_name=req.dataset_name,
@@ -88,14 +122,24 @@ def run_eval(req: RunEvalRequest, db: Session = Depends(get_db)) -> dict[str, An
     db.commit()
     db.refresh(run)
 
-    q = get_queue()
-    job = q.enqueue(
-        run_eval_pipeline,
-        run_id=run.id,
-        dataset_name=req.dataset_name,
-        n_questions=req.n_questions,
-        models=req.models,
-    )
+    try:
+        q = get_queue()
+        job = q.enqueue(
+            _PIPELINE_TASK,
+            run_id=run.id,
+            dataset_name=req.dataset_name,
+            n_questions=req.n_questions,
+            models=req.models,
+        )
+    except Exception as exc:
+        run.status = RunStatus.FAILED
+        run.error_message = f"Failed to enqueue job: {exc}"[:2000]
+        db.commit()
+        logger.exception("Enqueue failed for run_id=%d", run.id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Run {run.id} created but enqueue failed (is Redis up?).",
+        )
 
     return {"run_id": run.id, "job_id": job.id, "status": "queued"}
 
@@ -274,8 +318,14 @@ def get_cache_stats() -> dict[str, Any]:
 
 
 @app.get("/health")
-def health(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Return connectivity status for PostgreSQL and Redis."""
+def health(db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Return connectivity status for PostgreSQL and Redis.
+
+    Responds 503 when degraded so HTTP-status-based healthchecks (Docker's
+    `curl -sf`) actually fail when a dependency is down — a 200 with
+    "degraded" in the body would count as healthy.
+    """
     pg_ok = False
     pg_error: str | None = None
     try:
@@ -292,8 +342,12 @@ def health(db: Session = Depends(get_db)) -> dict[str, Any]:
     except Exception as exc:
         redis_error = str(exc)
 
-    return {
-        "status": "ok" if (pg_ok and redis_ok) else "degraded",
-        "postgres": {"ok": pg_ok, "error": pg_error},
-        "redis": {"ok": redis_ok, "error": redis_error},
-    }
+    healthy = pg_ok and redis_ok
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status": "ok" if healthy else "degraded",
+            "postgres": {"ok": pg_ok, "error": pg_error},
+            "redis": {"ok": redis_ok, "error": redis_error},
+        },
+    )

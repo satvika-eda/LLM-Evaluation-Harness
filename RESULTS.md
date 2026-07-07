@@ -1,5 +1,15 @@
 # Evaluation Results
 
+> ⚠️ **These results predate a set of scoring-pipeline fixes and are pending
+> re-run.** Known issues with the numbers below: HotpotQA was answered
+> closed-book (retrieval context never reached the model prompt) while
+> faithfulness/hallucination graded answers against that unseen context;
+> TruthfulQA faithfulness/hallucination were judged against an empty context
+> (undefined); context_recall is constant across models by construction and
+> has been removed; and cached generations may have been reused across the
+> "independent" runs. Coherence and answer-relevance rankings are unaffected.
+> This file will be regenerated from post-fix runs.
+
 Benchmark of three open-weight LLMs on **faithfulness, hallucination, answer
 relevance, coherence, context recall, and semantic similarity**, using RAGAS,
 DeepEval, and BERTScore with an LLM-as-judge.
@@ -20,6 +30,29 @@ and Llama-3.1-8B third.
 | **Scale** | 1,800 model responses · 13,500 metric scores |
 
 Arrows indicate direction of "better": ↑ higher is better, ↓ lower is better.
+
+## The six runs
+
+The benchmark is made up of **6 evaluation runs** — 3 per dataset. Each run
+evaluates all three models on the same 100 questions; running each dataset three
+times is what lets every reported metric be a **mean ± standard deviation across
+runs** rather than a single point estimate.
+
+| Runs | Dataset | Responses per run | Metrics / response | Scores per run |
+|---|---|---|---|---|
+| 1, 2, 3 | HotpotQA | 300 (100 questions × 3 models) | 8 | 2,400 |
+| 4, 5, 6 | TruthfulQA | 300 (100 questions × 3 models) | 7\* | 2,100 |
+
+\* TruthfulQA has no retrieval context, so `context_recall` is not computed
+(7 metrics instead of 8).
+
+**Totals:** 6 runs × 300 responses = **1,800 responses**, and
+(3 × 2,400) + (3 × 2,100) = **13,500 scores**.
+
+Each run is independent (fresh model generations, freshly judged), so the spread
+across the three runs of a dataset captures judge non-determinism and sampling
+variability. The resulting std values are small (≤ 0.03 on every metric), which
+is why the model rankings are trustworthy and not an artifact of one lucky run.
 
 ## HotpotQA (100 questions × 3 runs)
 

@@ -50,6 +50,7 @@ from src.datasets.loader import (
     TRUTHFULQA_NAME,
     load_hotpotqa,
     load_truthfulqa,
+    sample_questions,
     save_questions_to_db,
 )
 from src.db import EvalRun, Question, Response, RunStatus, SessionLocal
@@ -60,16 +61,28 @@ logger = logging.getLogger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+_SAMPLE_SEED = 42
+
+
 def _load_questions(dataset_name: str, n: int) -> list[dict]:
-    """Dispatch to the correct loader by dataset name."""
+    """
+    Load the full split and take a deterministic seed-42 random sample.
+
+    Sampling from the full split (rather than the head) keeps the subset
+    representative, and the fixed seed means every run of size n evaluates
+    exactly the same questions — the property the cross-run mean ± std
+    methodology depends on.
+    """
     if dataset_name == TRUTHFULQA_NAME:
-        return load_truthfulqa(n=n)
-    if dataset_name == HOTPOTQA_NAME:
-        return load_hotpotqa(n=n)
-    raise ValueError(
-        f"Unknown dataset {dataset_name!r}. "
-        f"Supported: {TRUTHFULQA_NAME!r}, {HOTPOTQA_NAME!r}"
-    )
+        questions = load_truthfulqa()
+    elif dataset_name == HOTPOTQA_NAME:
+        questions = load_hotpotqa()
+    else:
+        raise ValueError(
+            f"Unknown dataset {dataset_name!r}. "
+            f"Supported: {TRUTHFULQA_NAME!r}, {HOTPOTQA_NAME!r}"
+        )
+    return sample_questions(questions, n, seed=_SAMPLE_SEED)
 
 
 def _set_status(
@@ -103,14 +116,18 @@ def _set_status(
 async def _run_questions_async(
     questions: list[Question],
     run_id: int,
+    models: list[str] | None,
 ) -> list:
     """
-    Run all three models for every question, one question at a time.
+    Run the selected models for every question, one question at a time.
 
     Questions are processed sequentially so each question gets its own
     short session, keeping flush/commit granularity tight and making
-    partial results immediately queryable.  Within each question the three
-    model calls run concurrently via asyncio.gather (inside run_all_models).
+    partial results immediately queryable.  Within each question the
+    selected model calls run concurrently via asyncio.gather (inside
+    run_all_models). The question's retrieval context is passed through
+    so context-bearing datasets (HotpotQA) are answered from their
+    passages, matching what the context-grounded metrics grade against.
     """
     all_results = []
     for q in questions:
@@ -121,6 +138,8 @@ async def _run_questions_async(
                     question_id=q.id,
                     run_id=run_id,
                     session=session,
+                    context=q.context or "",
+                    models=models,
                 )
                 session.commit()
                 all_results.extend(results)
@@ -186,9 +205,9 @@ def run_eval_pipeline(
     run_id       : PK of an existing EvalRun row (status must be "pending")
     dataset_name : "truthfulqa" or "hotpotqa"
     n_questions  : number of questions to sample from the dataset
-    models       : list of model identifiers — informational only at this
-                   stage; run_all_models always calls all three providers.
-                   Reserved for future per-model filtering.
+    models       : model identifiers to evaluate (validated against the
+                   runner registry; unknown names fail the run). An empty
+                   list or None runs every registered model.
 
     Returns
     -------
@@ -218,28 +237,31 @@ def run_eval_pipeline(
 
         with SessionLocal() as session:
             session.expire_on_commit = False  # keep attribute values after commit
-            save_questions_to_db(raw_questions, session)
+            # Returns one ORM row per sampled question (existing rows are
+            # reused), so inference runs on exactly the seed-42 sample —
+            # never an arbitrary LIMIT-n subset of the table.
+            questions = save_questions_to_db(raw_questions, session)
             session.commit()
-            # Fetch all questions for this dataset (new + pre-existing duplicates).
-            questions = (
-                session.query(Question)
-                .filter(Question.dataset_name == dataset_name)
-                .limit(n_questions)
-                .all()
-            )
             session.expunge_all()
 
         logger.info("%d questions ready (new + existing).", len(questions))
 
         # ── 3. Run model inference (async) ────────────────────────────────────
         logger.info("Running model inference for %d questions…", len(questions))
-        all_results = asyncio.run(_run_questions_async(questions, run_id))
+        all_results = asyncio.run(
+            _run_questions_async(questions, run_id, models or None)
+        )
 
         successful = [r for r in all_results if not r.error]
         failed     = [r for r in all_results if r.error]
         logger.info(
             "Inference complete: %d succeeded, %d failed.", len(successful), len(failed)
         )
+        if all_results and not successful:
+            raise RuntimeError(
+                f"All {len(all_results)} model calls failed — marking run as "
+                "failed instead of scoring an empty result set."
+            )
 
         # ── 4. Score responses (async) ────────────────────────────────────────
         orchestrator = ScoringOrchestrator()
