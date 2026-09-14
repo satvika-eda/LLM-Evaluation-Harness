@@ -90,6 +90,15 @@ class EvalRun(Base):
 
     models_evaluated stores the list of model identifiers that were tested,
     e.g. ["gpt-4o", "claude-3-5-sonnet", "mistral-7b"].
+
+    judge_model records which LLM judged this run's RAGAS/DeepEval metrics
+    (whatever LLM_JUDGE_MODEL was configured when scoring ran — see
+    src.scorers.judge_config). Set once, right before scoring, since a single
+    run always scores under one fixed judge config. Nullable because runs
+    scored before this column existed have no recorded value. BERTScore
+    metrics are judge-independent and comparable regardless of this field —
+    only ragas/* and deepeval/* metrics require matching judge_model to be
+    comparable across runs (see /leaderboard).
     """
 
     __tablename__ = "eval_runs"
@@ -112,6 +121,7 @@ class EvalRun(Base):
         default=RunStatus.PENDING,
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    judge_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

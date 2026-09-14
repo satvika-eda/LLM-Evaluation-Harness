@@ -29,6 +29,8 @@ dependencies = [
     "psycopg2-binary>=2.9.9",
     # Scoring
     "bert-score>=0.3.13",
+    # Experiment tracking
+    "mlflow>=2.14.0",
     # HTTP client (async, for HuggingFace Inference API)
     "aiohttp>=3.9.0",
     # Cache & job queue

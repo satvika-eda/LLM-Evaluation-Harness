@@ -14,12 +14,17 @@ def judge_config(default_api_key: str | None = None) -> dict[str, str | None]:
     The judge is the model that grades responses (faithfulness, hallucination,
     coherence, …); it is independent of the models being benchmarked. Configure
     it via environment variables so you can swap in a cheaper / higher-rate-limit
-    judge (e.g. ``gpt-4o-mini``) or an OpenAI-compatible endpoint without editing
-    scorer code:
+    judge or an open-weight model on an OpenAI-compatible endpoint (e.g. the HF
+    Inference Providers router) without editing scorer code:
 
       LLM_JUDGE_MODEL  judge model id            (default ``gpt-4o``)
       JUDGE_BASE_URL   OpenAI-compatible base URL (default: OpenAI's own)
       JUDGE_API_KEY    key for that endpoint      (default: OPENAI_API_KEY)
+
+    The DeepEval scorer uses ``OpenAICompatibleJudgeModel`` (see
+    ``src.scorers.judge_model``) rather than DeepEval's built-in ``GPTModel`` so
+    that an arbitrary model id / base_url actually works — ``GPTModel`` rejects
+    any model outside a hardcoded OpenAI whitelist and ignores ``base_url``.
 
     Note: RAGAS embeddings (answer-relevance) always stay on OpenAI regardless of
     these settings — the judge base URL may not serve an embeddings endpoint.

@@ -38,6 +38,14 @@ DATASET_LABELS: dict[str, str] = {
     "hotpotqa": "HotpotQA",
 }
 
+# The judge a freshly-started run would use — mirrors src.scorers.judge_config()'s
+# default so the dashboard's default filter matches the API's without an extra
+# round trip. Different judges score ragas/*/deepeval/* differently, so this is
+# also the pre-selected option in the judge filter below (see ALL_JUDGES_OPTION).
+CURRENT_JUDGE_MODEL: str = os.environ.get("LLM_JUDGE_MODEL", "gpt-4o")
+ALL_JUDGES_OPTION = "__all__"
+_JUDGE_INDEPENDENT_PREFIX = "bertscore/"
+
 ALL_METRICS: list[str] = [
     "ragas/faithfulness",
     "ragas/answer_relevance",
@@ -65,11 +73,16 @@ LOWER_IS_BETTER: set[str] = {"deepeval/hallucination"}
 # ── API helpers ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_leaderboard(dataset: str | None = None) -> list[dict]:
-    params = {"dataset": dataset} if dataset else None
-    resp = requests.get(f"{FASTAPI_URL}/leaderboard", params=params, timeout=10)
+def fetch_leaderboard(dataset: str | None = None, judge_model: str | None = None) -> dict:
+    """Returns the full {"judge_model": ..., "leaderboard": [...]} response."""
+    params = {}
+    if dataset:
+        params["dataset"] = dataset
+    if judge_model:
+        params["judge_model"] = judge_model
+    resp = requests.get(f"{FASTAPI_URL}/leaderboard", params=params or None, timeout=10)
     resp.raise_for_status()
-    return resp.json()["leaderboard"]
+    return resp.json()
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -93,7 +106,9 @@ def fetch_results(run_id: int) -> dict:
     return resp.json()["results"]
 
 
-def fetch_aggregate_scores(dataset: str | None = None) -> dict[str, dict[str, list[float]]]:
+def fetch_aggregate_scores(
+    dataset: str | None = None, judge_model: str | None = None
+) -> dict[str, dict[str, list[float]]]:
     """
     Walk all completed runs and aggregate per-run metric averages.
     Returns {model: {metric: [avg_from_run_1, avg_from_run_2, ...]}}
@@ -102,18 +117,28 @@ def fetch_aggregate_scores(dataset: str | None = None) -> dict[str, dict[str, li
     When ``dataset`` is given, only runs on that dataset are included, so
     dataset-dependent metrics (faithfulness, context-recall) aren't blended
     across datasets that do and don't ship context.
+
+    When ``judge_model`` is given (and isn't ALL_JUDGES_OPTION), a run whose
+    judge_model doesn't match contributes only its bertscore/* metrics —
+    ragas/* and deepeval/* scores from a different judge aren't comparable
+    and would otherwise silently corrupt the cross-run mean/std. Mirrors the
+    /leaderboard endpoint's filtering.
     """
     runs = fetch_runs()
+    blend_all_judges = judge_model in (None, ALL_JUDGES_OPTION)
     agg: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for run in runs:
         if run.get("status") != "completed":
             continue
         if dataset and run.get("dataset_name") != dataset:
             continue
+        judge_matches = blend_all_judges or run.get("judge_model") == judge_model
         try:
             results = fetch_results(run["id"])
             for model, metrics in results.items():
                 for metric, avg_score in metrics.items():
+                    if not judge_matches and not metric.startswith(_JUDGE_INDEPENDENT_PREFIX):
+                        continue
                     agg[model][metric].append(float(avg_score))
         except Exception:
             continue
@@ -138,6 +163,20 @@ st.set_page_config(
 st.title("🧪 LLM Evaluation Harness")
 st.caption(f"Connected to backend: `{FASTAPI_URL}`")
 
+with st.expander("📈 Experiment tracking (MLflow)"):
+    st.markdown(
+        "Every completed run is also logged to MLflow — a parent run per "
+        "eval run, with one nested child run per model (its metrics + cost). "
+        "This dashboard reads from Postgres directly; MLflow is a separate, "
+        "independent view over the same results, useful for comparing runs "
+        "side by side or tracking metric history over time.\n\n"
+        "Browse it with:\n"
+        "```\n"
+        "mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5001\n"
+        "```\n"
+        "then open [http://localhost:5001](http://localhost:5001)."
+    )
+
 # ── Dataset filter (applies to Leaderboard, Cost vs Quality, Metric Explorer) ──
 # Faithfulness and context-recall are only meaningful on datasets that ship
 # retrieval context (HotpotQA); scoping by dataset avoids blending them with a
@@ -155,11 +194,40 @@ selected_dataset = st.selectbox(
 )
 dataset_filter: str | None = None if selected_dataset == "__all__" else selected_dataset
 
+# ── Judge filter (applies to Leaderboard, Cost vs Quality, Metric Explorer) ────
+# Different LLM judges score ragas/*/deepeval/* metrics differently (e.g.
+# faithfulness), so blending runs scored by different judges produces
+# meaningless averages — bertscore/* is judge-independent and always included
+# regardless of this filter. Defaults to the judge a fresh run would use.
+_judges_seen = sorted(
+    {r["judge_model"] for r in fetch_runs() if r.get("judge_model")} - {CURRENT_JUDGE_MODEL}
+)
+_JUDGE_FILTER_OPTIONS = [CURRENT_JUDGE_MODEL, ALL_JUDGES_OPTION, *_judges_seen]
+selected_judge = st.selectbox(
+    "Judge model filter",
+    options=_JUDGE_FILTER_OPTIONS,
+    format_func=lambda j: (
+        f"{j} (current)" if j == CURRENT_JUDGE_MODEL
+        else "All judges (mixed — not apples-to-apples)" if j == ALL_JUDGES_OPTION
+        else j
+    ),
+    help=(
+        "Scope RAGAS/DeepEval metrics to one judge model. Runs scored by "
+        "a different judge only contribute their (judge-independent) "
+        "BERTScore metrics unless 'All judges' is selected."
+    ),
+    key="judge_filter",
+)
+judge_filter: str | None = None if selected_judge == CURRENT_JUDGE_MODEL else selected_judge
+
 # Pre-fetch leaderboard data (shared between tab 1 and tab 2)
 leaderboard_data: list[dict] = []
+leaderboard_judge_model: str | None = None
 leaderboard_error: str | None = None
 try:
-    leaderboard_data = fetch_leaderboard(dataset_filter)
+    _leaderboard_resp = fetch_leaderboard(dataset_filter, judge_filter)
+    leaderboard_data = _leaderboard_resp["leaderboard"]
+    leaderboard_judge_model = _leaderboard_resp.get("judge_model")
 except Exception as exc:
     leaderboard_error = str(exc)
 
@@ -179,6 +247,13 @@ with tab_lb:
         "🟢 = best · 🔴 = worst for each column. "
         "For Hallucination and Cost, lower values are better."
     )
+    if leaderboard_judge_model == ALL_JUDGES_OPTION:
+        st.warning(
+            "Showing scores blended across every judge model ever used — "
+            "RAGAS/DeepEval averages are not apples-to-apples here."
+        )
+    elif leaderboard_judge_model:
+        st.caption(f"Judge model: `{leaderboard_judge_model}`")
 
     if leaderboard_error:
         st.error(f"Could not load leaderboard: {leaderboard_error}")
@@ -317,7 +392,7 @@ with tab_me:
     agg_error: str | None = None
     agg_scores: dict[str, dict[str, list[float]]] = {}
     try:
-        agg_scores = fetch_aggregate_scores(dataset_filter)
+        agg_scores = fetch_aggregate_scores(dataset_filter, judge_filter)
     except Exception as exc:
         agg_error = str(exc)
 

@@ -59,18 +59,19 @@ class DeepEvalScorer:
         The judge (model id, base URL, API key) is configured via environment
         variables — see ``src.scorers.judge_config`` — so it can be swapped for
         a cheaper / higher-rate-limit model (e.g. ``gpt-4o-mini``) or an
-        OpenAI-compatible endpoint without touching this code. Defaults to
-        GPT-4o via OpenAI.
+        open-weight model on an OpenAI-compatible endpoint (e.g. the HF router)
+        without touching this code. Uses ``OpenAICompatibleJudgeModel`` rather
+        than DeepEval's built-in ``GPTModel``, which rejects any model id
+        outside a hardcoded OpenAI whitelist and ignores ``base_url`` entirely.
         """
         if self._model is None:
-            from deepeval.models import GPTModel
-
             from src.scorers import judge_config
+            from src.scorers.judge_model import OpenAICompatibleJudgeModel
 
             cfg = judge_config(self._api_key)
-            self._model = GPTModel(
+            self._model = OpenAICompatibleJudgeModel(
                 model=cfg["model"],
-                _openai_api_key=cfg["api_key"],
+                api_key=cfg["api_key"],
                 base_url=cfg["base_url"],
             )
         return self._model

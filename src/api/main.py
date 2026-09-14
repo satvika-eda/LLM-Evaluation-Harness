@@ -22,12 +22,13 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from src.cache.cache import cache_stats, get_redis_client
 from src.db import EvalRun, Question, Response, RunStatus, Score, create_tables, get_db
 from src.runners.runner import _MODELS
+from src.scorers import judge_config
 from src.worker.worker import get_queue
 
 # The pipeline is enqueued by dotted-path string (see run_eval below) rather
@@ -156,6 +157,7 @@ def list_runs(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
             "models_evaluated": r.models_evaluated,
             "status": r.status,
             "error_message": r.error_message,
+            "judge_model": r.judge_model,
             "created_at": r.created_at,
             "completed_at": r.completed_at,
         }
@@ -206,8 +208,16 @@ def get_results(run_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     return {"run_id": run_id, "results": results}
 
 
+_JUDGE_INDEPENDENT_PREFIX = "bertscore/"
+_ALL_JUDGES = "__all__"
+
+
 @app.get("/leaderboard")
-def leaderboard(dataset: str | None = None, db: Session = Depends(get_db)) -> dict[str, Any]:
+def leaderboard(
+    dataset: str | None = None,
+    judge_model: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     """
     Return all models ranked by average faithfulness score (descending).
 
@@ -215,15 +225,27 @@ def leaderboard(dataset: str | None = None, db: Session = Depends(get_db)) -> di
 
     Query params
     ------------
-    dataset : optional dataset name (e.g. "hotpotqa"). When given, only scores
-              and costs from responses to that dataset's questions are counted.
-              Omit to aggregate across all datasets. Filtering by dataset avoids
-              blending metrics that are dataset-dependent — e.g. faithfulness is
-              ~0 on context-free TruthfulQA but meaningful on HotpotQA.
+    dataset     : optional dataset name (e.g. "hotpotqa"). When given, only
+                  scores and costs from responses to that dataset's questions
+                  are counted. Omit to aggregate across all datasets.
+                  Filtering by dataset avoids blending metrics that are
+                  dataset-dependent — e.g. faithfulness is ~0 on context-free
+                  TruthfulQA but meaningful on HotpotQA.
+    judge_model : which LLM judge's ragas/* and deepeval/* scores to include
+                  (see EvalRun.judge_model). Different judges score
+                  faithfulness/hallucination/coherence differently, so
+                  blending runs scored by different judges produces
+                  meaningless averages. Omit to default to the CURRENTLY
+                  configured judge (LLM_JUDGE_MODEL env var) — the judge a
+                  fresh run would use. Pass "__all__" to explicitly blend
+                  every judge ever used (for methodology comparisons only,
+                  not model-quality ones). bertscore/* metrics are
+                  judge-independent and always included regardless.
 
     Response shape
     --------------
     {
+        "judge_model": "google/gemma-3-27b-it",
         "leaderboard": [
             {
                 "rank": 1,
@@ -242,6 +264,9 @@ def leaderboard(dataset: str | None = None, db: Session = Depends(get_db)) -> di
     """
     _FAITHFULNESS = "ragas/faithfulness"
 
+    judge_filter = judge_model or judge_config()["model"]
+    blend_all_judges = judge_filter == _ALL_JUDGES
+
     score_q = (
         db.query(Response.model_name, Score.metric_name, Score.score)
         .join(Score, Score.response_id == Response.id)
@@ -256,6 +281,13 @@ def leaderboard(dataset: str | None = None, db: Session = Depends(get_db)) -> di
         )
         cost_q = cost_q.join(Question, Question.id == Response.question_id).filter(
             Question.dataset_name == dataset
+        )
+    if not blend_all_judges:
+        score_q = score_q.join(EvalRun, EvalRun.id == Response.run_id).filter(
+            or_(
+                Score.metric_name.startswith(_JUDGE_INDEPENDENT_PREFIX),
+                EvalRun.judge_model == judge_filter,
+            )
         )
 
     score_rows = score_q.all()
@@ -286,7 +318,10 @@ def leaderboard(dataset: str | None = None, db: Session = Depends(get_db)) -> di
     for rank, entry in enumerate(entries, start=1):
         entry["rank"] = rank
 
-    return {"leaderboard": entries}
+    return {
+        "judge_model": _ALL_JUDGES if blend_all_judges else judge_filter,
+        "leaderboard": entries,
+    }
 
 
 @app.get("/cache/stats")

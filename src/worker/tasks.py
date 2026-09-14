@@ -6,7 +6,7 @@ The single public task — run_eval_pipeline — is enqueued by callers
 process.  It owns the full end-to-end pipeline for one evaluation run:
 
     load questions  →  run models (async)  →  score responses (async)
-    →  mark run completed / failed
+    →  log to MLflow (best-effort)  →  mark run completed / failed
 
 Pipeline design
 ---------------
@@ -53,9 +53,10 @@ from src.datasets.loader import (
     sample_questions,
     save_questions_to_db,
 )
-from src.db import EvalRun, Question, Response, RunStatus, SessionLocal
+from src.db import EvalRun, Question, Response, RunStatus, Score, SessionLocal
 from src.runners.runner import run_all_models
 from src.scorers.orchestrator import ScoringOrchestrator
+from src.tracking.mlflow_tracker import log_eval_run
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,29 @@ def _load_questions(dataset_name: str, n: int) -> list[dict]:
             f"Supported: {TRUTHFULQA_NAME!r}, {HOTPOTQA_NAME!r}"
         )
     return sample_questions(questions, n, seed=_SAMPLE_SEED)
+
+
+def _record_judge_model(run_id: int) -> None:
+    """
+    Stamp EvalRun.judge_model with the currently configured judge, right
+    before scoring starts.
+
+    A run's RAGAS/DeepEval metrics are only comparable to another run's if
+    both were scored under the same judge — see EvalRun.judge_model and the
+    /leaderboard endpoint's filtering. Recorded per-run (not per-score) since
+    judge_config() is fixed for the whole scoring pass of one run.
+    """
+    from src.scorers import judge_config
+
+    model = judge_config()["model"]
+    with SessionLocal() as session:
+        run = session.get(EvalRun, run_id)
+        if run is None:
+            logger.error("EvalRun id=%d not found when recording judge_model", run_id)
+            return
+        run.judge_model = model
+        session.commit()
+    logger.info("EvalRun id=%d → judge_model=%s", run_id, model)
 
 
 def _set_status(
@@ -189,6 +213,46 @@ async def _score_responses_async(
         )
 
 
+def _compute_run_results(
+    run_id: int, session,
+) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+    """
+    Aggregate a completed run's per-model metric averages and average cost,
+    for logging to MLflow. Mirrors GET /results/{run_id} and the cost
+    aggregation in GET /leaderboard.
+
+    Returns (results, avg_cost_by_model) where results is
+    {model_name: {metric_name: avg_score}}.
+    """
+    from collections import defaultdict
+
+    score_rows = (
+        session.query(Response.model_name, Score.metric_name, Score.score)
+        .join(Score, Score.response_id == Response.id)
+        .filter(Response.run_id == run_id)
+        .all()
+    )
+    metric_lists: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for model_name, metric_name, score in score_rows:
+        metric_lists[model_name][metric_name].append(score)
+    results = {
+        model: {m: sum(v) / len(v) for m, v in metrics.items()}
+        for model, metrics in metric_lists.items()
+    }
+
+    cost_rows = (
+        session.query(Response.model_name, Response.cost_usd)
+        .filter(Response.run_id == run_id, Response.cost_usd.isnot(None))
+        .all()
+    )
+    cost_lists: dict[str, list[float]] = defaultdict(list)
+    for model_name, cost in cost_rows:
+        cost_lists[model_name].append(cost)
+    avg_cost_by_model = {m: sum(c) / len(c) for m, c in cost_lists.items()}
+
+    return results, avg_cost_by_model
+
+
 # ── Public RQ task ────────────────────────────────────────────────────────────
 
 def run_eval_pipeline(
@@ -219,6 +283,8 @@ def run_eval_pipeline(
     * Updates EvalRun.status in PostgreSQL throughout execution.
     * Writes Response and Score rows.
     * Populates the Redis response cache.
+    * Logs the run's params/metrics to MLflow (see src.tracking.mlflow_tracker;
+      best-effort — a tracking failure is logged but never fails the run).
     """
     logger.info(
         "run_eval_pipeline START  run_id=%d  dataset=%s  n=%d  models=%s",
@@ -264,11 +330,30 @@ def run_eval_pipeline(
             )
 
         # ── 4. Score responses (async) ────────────────────────────────────────
+        _record_judge_model(run_id)
         orchestrator = ScoringOrchestrator()
         logger.info("Running scoring orchestrator…")
         asyncio.run(_score_responses_async(run_id, questions, orchestrator))
 
-        # ── 5. Mark completed ─────────────────────────────────────────────────
+        # ── 5. Log to MLflow (best-effort; never fails the run) ────────────────
+        try:
+            with SessionLocal() as session:
+                run = session.get(EvalRun, run_id)
+                results, avg_cost_by_model = _compute_run_results(run_id, session)
+            log_eval_run(
+                run_id=run_id,
+                run_name=run.run_name,
+                dataset_name=dataset_name,
+                n_questions=n_questions,
+                models=list(results.keys()),
+                judge_model=run.judge_model,
+                results=results,
+                avg_cost_by_model=avg_cost_by_model,
+            )
+        except Exception:
+            logger.exception("Failed to log EvalRun id=%d to MLflow (non-fatal).", run_id)
+
+        # ── 6. Mark completed ─────────────────────────────────────────────────
         _set_status(
             run_id,
             RunStatus.COMPLETED,
@@ -287,7 +372,7 @@ def run_eval_pipeline(
         return summary
 
     except Exception as exc:
-        # ── 6. Mark failed ────────────────────────────────────────────────────
+        # ── 7. Mark failed ────────────────────────────────────────────────────
         tb = traceback.format_exc()
         logger.exception("run_eval_pipeline FAILED run_id=%d", run_id)
         _set_status(

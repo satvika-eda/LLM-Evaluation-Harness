@@ -157,6 +157,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# MLflow local tracking store (see MLFLOW_TRACKING_URI in .env.example)
+mlflow.db
+mlruns/
+
 # Spyder project settings
 .spyderproject
 .spyproject
